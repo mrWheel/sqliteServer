@@ -177,8 +177,8 @@ static esp_err_t sql_post_handler(httpd_req_t *req) {
   // Enforce JSON only
   char ctype[64] = {0};
   if (httpd_req_get_hdr_value_str(req, "Content-Type", ctype, sizeof(ctype)) != ESP_OK ||
-      strncmp(ctype, "application/json", 16) != 0) {
-    httpd_resp_send_err(req, HTTPD_415_UNSUPPORTED_MEDIA_TYPE, "Content-Type must be application/json");
+    strncmp(ctype, "application/json", 16) != 0) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Content-Type must be application/json");
     return ESP_FAIL;
   }
 

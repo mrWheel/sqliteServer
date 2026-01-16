@@ -2,6 +2,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <ctype.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
