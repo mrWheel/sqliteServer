@@ -10,6 +10,8 @@
 
 #include "esp_log.h"
 #include "esp_http_server.h"
+#include "esp_system.h"
+#include "nvs_flash.h"
 
 static const char *TAG = "SQLAPI";
 
@@ -17,7 +19,7 @@ static sqlite3 *g_db = NULL;
 static SemaphoreHandle_t g_db_mutex;
 static httpd_handle_t g_server = NULL;
 
-/* ---- minimal JSON escape for output ---- */
+/* -------------------- JSON helpers (output) -------------------- */
 static void json_write_escaped(httpd_req_t *req, const char *s) {
   httpd_resp_sendstr_chunk(req, "\"");
   for (const unsigned char *p = (const unsigned char*)s; p && *p; p++) {
@@ -38,27 +40,86 @@ static void json_write_escaped(httpd_req_t *req, const char *s) {
   httpd_resp_sendstr_chunk(req, "\"");
 }
 
-/* ---- JSON input: only {"sql":"..."} (simple parser, no escaping support) ---- */
-static char *json_extract_sql(const char *body) {
-  const char *k = "\"sql\"";
-  const char *p = strstr(body, k);
-  if (!p) return NULL;
-  p = strchr(p, ':'); if (!p) return NULL;
+/* -------------------- minimal JSON parsing (input) --------------------
+   NOTE: bewust simpel: verwacht {"key":"value"} zonder escaped quotes.
+*/
+static bool json_get_str(const char *body, const char *key, char *out, size_t outlen) {
+  if (!body || !key || !out || outlen == 0) return false;
+
+  char pat[48];
+  snprintf(pat, sizeof(pat), "\"%s\"", key);
+
+  const char *p = strstr(body, pat);
+  if (!p) return false;
+
+  p = strchr(p, ':');
+  if (!p) return false;
   p++;
+
   while (*p && isspace((unsigned char)*p)) p++;
-  if (*p != '"') return NULL;
+  if (*p != '"') return false;
   p++;
+
   const char *e = strchr(p, '"');
-  if (!e) return NULL;
+  if (!e) return false;
 
   size_t n = (size_t)(e - p);
-  char *out = (char*)malloc(n + 1);
+  if (n >= outlen) n = outlen - 1;
   memcpy(out, p, n);
   out[n] = 0;
-  return out;
+  return true;
 }
 
-/* ---- Execute multi-statement SQL and stream JSON ---- */
+static esp_err_t recv_body_all(httpd_req_t *req, char **out_body, int max_len) {
+  if (!out_body) return ESP_ERR_INVALID_ARG;
+  *out_body = NULL;
+
+  int len = req->content_len;
+  if (len <= 0 || len > max_len) return ESP_ERR_INVALID_SIZE;
+
+  char *body = (char*)calloc(1, len + 1);
+  if (!body) return ESP_ERR_NO_MEM;
+
+  int got = 0;
+  while (got < len) {
+    int r = httpd_req_recv(req, body + got, len - got);
+    if (r <= 0) {
+      free(body);
+      return ESP_FAIL;
+    }
+    got += r;
+  }
+  body[len] = 0;
+  *out_body = body;
+  return ESP_OK;
+}
+
+/* -------------------- NVS WiFi save -------------------- */
+static esp_err_t nvs_save_wifi(const char *ssid, const char *pass) {
+  if (!ssid || ssid[0] == 0) return ESP_ERR_INVALID_ARG;
+
+  nvs_handle_t h;
+  esp_err_t err = nvs_open("wifi", NVS_READWRITE, &h);
+  if (err != ESP_OK) return err;
+
+  err = nvs_set_str(h, "ssid", ssid);
+  if (err == ESP_OK) err = nvs_set_str(h, "pass", pass ? pass : "");
+  if (err == ESP_OK) err = nvs_commit(h);
+
+  nvs_close(h);
+  return err;
+}
+
+/* -------------------- SQLite runner (multi-statement) --------------------
+Response:
+{
+  "results":[
+    {"type":"select","columns":["a"],"rows":[[1],[2]]},
+    {"type":"ok","changes":1,"last_insert_rowid":123}
+  ],
+  "error": null
+}
+*/
 static esp_err_t exec_sql_all(httpd_req_t *req, const char *sql_in) {
   xSemaphoreTake(g_db_mutex, portMAX_DELAY);
 
@@ -80,10 +141,10 @@ static esp_err_t exec_sql_all(httpd_req_t *req, const char *sql_in) {
       httpd_resp_sendstr_chunk(req, NULL);
       if (stmt) sqlite3_finalize(stmt);
       xSemaphoreGive(g_db_mutex);
-      return ESP_OK;
+      return ESP_OK; // 200 met error payload
     }
 
-    if (!stmt) break; // done
+    if (!stmt) break;
 
     int col_count = sqlite3_column_count(stmt);
     bool is_select_like = (col_count > 0);
@@ -173,43 +234,93 @@ static esp_err_t exec_sql_all(httpd_req_t *req, const char *sql_in) {
   return ESP_OK;
 }
 
-static esp_err_t sql_post_handler(httpd_req_t *req) {
-  // Enforce JSON only
+/* -------------------- HTTP handlers -------------------- */
+static bool content_type_is_json(httpd_req_t *req) {
   char ctype[64] = {0};
-  if (httpd_req_get_hdr_value_str(req, "Content-Type", ctype, sizeof(ctype)) != ESP_OK ||
-    strncmp(ctype, "application/json", 16) != 0) {
+  if (httpd_req_get_hdr_value_str(req, "Content-Type", ctype, sizeof(ctype)) != ESP_OK) return false;
+  return (strncmp(ctype, "application/json", 16) == 0);
+}
+
+static esp_err_t sql_post_handler(httpd_req_t *req) {
+  if (!content_type_is_json(req)) {
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Content-Type must be application/json");
     return ESP_FAIL;
   }
 
-  int len = req->content_len;
-  if (len <= 0 || len > 64 * 1024) {
-    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body size");
+  char *body = NULL;
+  esp_err_t err = recv_body_all(req, &body, 64 * 1024);
+  if (err != ESP_OK) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
     return ESP_FAIL;
   }
 
-  char *body = (char*)calloc(1, len + 1);
-  int r = httpd_req_recv(req, body, len);
-  if (r <= 0) {
-    free(body);
-    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "recv failed");
-    return ESP_FAIL;
+  char *sql = NULL;
+  {
+    char tmp[8] = {0}; // just to satisfy compiler scope warnings
+    (void)tmp;
   }
 
-  char *sql = json_extract_sql(body);
+  // Extract {"sql":"..."}
+  char *sql_buf = (char*)calloc(1, 64 * 1024);
+  if (!sql_buf) { free(body); httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom"); return ESP_FAIL; }
+  bool ok = json_get_str(body, "sql", sql_buf, 64 * 1024);
   free(body);
 
-  if (!sql || sql[0] == 0) {
-    free(sql);
+  if (!ok || sql_buf[0] == 0) {
+    free(sql_buf);
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing sql");
     return ESP_FAIL;
   }
+  sql = sql_buf;
 
-  esp_err_t err = exec_sql_all(req, sql);
+  err = exec_sql_all(req, sql);
   free(sql);
   return err;
 }
 
+static esp_err_t wifi_save_handler(httpd_req_t *req) {
+  if (!content_type_is_json(req)) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Content-Type must be application/json");
+    return ESP_FAIL;
+  }
+
+  char *body = NULL;
+  esp_err_t err = recv_body_all(req, &body, 1024);
+  if (err != ESP_OK) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
+    return ESP_FAIL;
+  }
+
+  char ssid[33] = {0};
+  char pass[65] = {0};
+
+  bool ok1 = json_get_str(body, "ssid", ssid, sizeof(ssid));
+  bool ok2 = json_get_str(body, "pass", pass, sizeof(pass));
+  (void)ok2; // pass mag leeg zijn
+
+  free(body);
+
+  if (!ok1 || ssid[0] == 0) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing ssid");
+    return ESP_FAIL;
+  }
+
+  err = nvs_save_wifi(ssid, pass);
+  if (err != ESP_OK) {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "nvs save failed");
+    return ESP_FAIL;
+  }
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_sendstr(req, "{\"ok\":true,\"saved\":true,\"rebooting\":true}");
+
+  // reboot nadat response verstuurd is
+  vTaskDelay(pdMS_TO_TICKS(500));
+  esp_restart();
+  return ESP_OK;
+}
+
+/* -------------------- Public start -------------------- */
 esp_err_t sql_api_start(sqlite3 *db) {
   if (!db) return ESP_ERR_INVALID_ARG;
   g_db = db;
@@ -218,6 +329,10 @@ esp_err_t sql_api_start(sqlite3 *db) {
 
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.stack_size = 12288;
+
+  // Belangrijk: we draaien op 8080 om niet te botsen met portal (80)
+  config.server_port = 8080;
+  config.ctrl_port = 32768 + 8080;
 
   if (httpd_start(&g_server, &config) != ESP_OK) {
     ESP_LOGE(TAG, "httpd_start failed");
@@ -232,6 +347,17 @@ esp_err_t sql_api_start(sqlite3 *db) {
   };
   httpd_register_uri_handler(g_server, &sql_uri);
 
-  ESP_LOGI(TAG, "SQL API ready: POST /sql (JSON only)");
+  httpd_uri_t wifi_uri = {
+    .uri = "/wifi/save",
+    .method = HTTP_POST,
+    .handler = wifi_save_handler,
+    .user_ctx = NULL
+  };
+  httpd_register_uri_handler(g_server, &wifi_uri);
+
+  ESP_LOGI(TAG, "SQL API ready:");
+  ESP_LOGI(TAG, "  POST http://<ip>:8080/sql  body: {\"sql\":\"SELECT 1;\"}");
+  ESP_LOGI(TAG, "  POST http://<ip>:8080/wifi/save body: {\"ssid\":\"...\",\"pass\":\"...\"}");
+
   return ESP_OK;
 }
