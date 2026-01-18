@@ -13,6 +13,8 @@
 #include "esp_system.h"
 #include "nvs_flash.h"
 
+#include "http_file_server.h"   // <-- JOUW component (niet https_file_server.h)
+
 static const char *TAG = "SQLAPI";
 
 static sqlite3 *g_db = NULL;
@@ -255,10 +257,6 @@ static esp_err_t sql_post_handler(httpd_req_t *req) {
   }
 
   char *sql = NULL;
-  {
-    char tmp[8] = {0}; // just to satisfy compiler scope warnings
-    (void)tmp;
-  }
 
   // Extract {"sql":"..."}
   char *sql_buf = (char*)calloc(1, 64 * 1024);
@@ -334,11 +332,15 @@ esp_err_t sql_api_start(sqlite3 *db) {
   config.server_port = 8080;
   config.ctrl_port = 32768 + 8080;
 
+  // Nodig voor "/static/*"
+  config.uri_match_fn = httpd_uri_match_wildcard;
+
   if (httpd_start(&g_server, &config) != ESP_OK) {
     ESP_LOGE(TAG, "httpd_start failed");
     return ESP_FAIL;
   }
 
+  // --- API handlers ---
   httpd_uri_t sql_uri = {
     .uri = "/sql",
     .method = HTTP_POST,
@@ -354,6 +356,23 @@ esp_err_t sql_api_start(sqlite3 *db) {
     .user_ctx = NULL
   };
   httpd_register_uri_handler(g_server, &wifi_uri);
+
+  // --- Static file server (SPIFFS/LittleFS data/) ---
+  // Zorg dat je FS gemount is op "/spiffs" voordat je dit aanroept.
+  http_file_server_config_t fcfg = {
+    .base_path = "/spiffs",
+    .uri_prefix = "/static",
+    .index_path = "/index.html",
+    .cache_control_no_store = true
+  };
+  esp_err_t ferr = http_file_server_register(g_server, &fcfg);
+  if (ferr != ESP_OK) {
+    ESP_LOGW(TAG, "http_file_server_register failed: %s", esp_err_to_name(ferr));
+  } else {
+    ESP_LOGI(TAG, "Static UI:");
+    ESP_LOGI(TAG, "  GET  http://<ip>:8080/            (index.html)");
+    ESP_LOGI(TAG, "  GET  http://<ip>:8080/static/...  (assets)");
+  }
 
   ESP_LOGI(TAG, "SQL API ready:");
   ESP_LOGI(TAG, "  POST http://<ip>:8080/sql  body: {\"sql\":\"SELECT 1;\"}");

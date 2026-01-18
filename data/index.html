@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ESP32 SQLite</title>
+
+  <!-- Let op: assets worden geserveerd via /static/* -->
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="top">
+    <div>
+      <h1>ESP32 SQLite</h1>
+      <div class="sub">
+        UI draait op dezelfde server als de API:
+        <code>POST /sql</code> · <code>POST /wifi/save</code>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="card">
+      <h2>SQL uitvoeren</h2>
+
+      <div class="row">
+        <button id="btnRun">Run</button>
+        <button id="btnExplain" class="secondary">Explain</button>
+        <button id="btnClear" class="secondary">Clear output</button>
+      </div>
+
+      <textarea id="sql" spellcheck="false">SELECT 1 AS one;</textarea>
+
+      <div class="hint">
+        Meerdere statements kan ook (als jouw backend dat ondersteunt), bijv:
+        <code>CREATE TABLE t(id INT, msg TEXT); INSERT INTO t VALUES(1,'hi'); SELECT * FROM t;</code>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Resultaat</h2>
+      <div id="status" class="status muted">Ready.</div>
+      <pre id="out" class="out"></pre>
+    </section>
+
+    <section class="card">
+      <h2>WiFi opslaan</h2>
+      <div class="hint">
+        Dit doet <code>POST /wifi/save</code> met JSON en reboot daarna (zoals je backend).
+      </div>
+
+      <div class="grid">
+        <label>
+          SSID
+          <input id="ssid" autocomplete="off" placeholder="SSID">
+        </label>
+
+        <label>
+          Password
+          <input id="pass" type="password" autocomplete="off" placeholder="Password (mag leeg)">
+        </label>
+      </div>
+
+      <div class="row">
+        <button id="btnSaveWifi" class="warn">Save WiFi &amp; reboot</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Snelle voorbeelden</h2>
+      <div class="examples">
+        <button class="secondary ex" data-sql="CREATE TABLE IF NOT EXISTS t(id INT, msg TEXT);">Create table</button>
+        <button class="secondary ex" data-sql="INSERT INTO t VALUES (1,'hello');">Insert</button>
+        <button class="secondary ex" data-sql="SELECT * FROM t;">Select</button>
+        <button class="secondary ex" data-sql="DROP TABLE IF EXISTS t;">Drop</button>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
