@@ -22,6 +22,7 @@ SKIP_DIRS = {
     "components/sqlite3",
     "components/esp-idf",
     "components/lwip",
+    "components/mdns",
     "components/freertos",
 }
 

@@ -21,8 +21,6 @@ static SemaphoreHandle_t s_db_mutex = NULL;
 
 static int s_listen_fd = -1;
 static int s_client_fd = -1;
-static int s_pushback_valid = 0;
-//-x-static unsigned char s_pushback_byte = 0;
 
 /* ---------- Console options (sqlite-ish) ---------- */
 typedef enum

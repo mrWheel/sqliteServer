@@ -11,6 +11,7 @@
 #include "nvs_flash.h"
 
 #include "esp_wifi.h"
+#include "mdns.h"
 
 #include "sqlite3.h"
 
@@ -31,6 +32,55 @@ static EventGroupHandle_t s_wifi_event_group;
 
 static int s_retry_num = 0;
 static const int WIFI_MAX_RETRY = 10;
+
+static esp_err_t mdns_start_advertising(void)
+{
+  esp_err_t err = mdns_init();
+  if (err != ESP_OK)
+  {
+    ESP_LOGE(TAG, "mdns_init failed: %s", esp_err_to_name(err));
+    return err;
+  }
+
+  err = mdns_hostname_set(HOSTNAME);
+  if (err != ESP_OK)
+  {
+    ESP_LOGE(TAG, "mdns_hostname_set failed: %s", esp_err_to_name(err));
+    return err;
+  }
+
+  err = mdns_instance_name_set("SQLite Server");
+  if (err != ESP_OK)
+  {
+    ESP_LOGE(TAG, "mdns_instance_name_set failed: %s", esp_err_to_name(err));
+    return err;
+  }
+
+  //-- HTTP REST API service: http://<hostname>.local:8080/sql
+  mdns_txt_item_t http_txt[] =
+  {
+    { "path", "/sql" }
+  };
+  err = mdns_service_add("SQLite HTTP API", "_http", "_tcp", 8080, http_txt, 1);
+  if (err != ESP_OK)
+  {
+    ESP_LOGE(TAG, "mdns_service_add(_http) failed: %s", esp_err_to_name(err));
+    return err;
+  }
+
+  //-- Telnet service: telnet <hostname>.local 23
+  err = mdns_service_add("SQLite Telnet Console", "_telnet", "_tcp", 23, NULL, 0);
+  if (err != ESP_OK)
+  {
+    ESP_LOGE(TAG, "mdns_service_add(_telnet) failed: %s", esp_err_to_name(err));
+    return err;
+  }
+
+  ESP_LOGI(TAG, "mDNS started: %s.local", HOSTNAME);
+  ESP_LOGI(TAG, "mDNS services: _http._tcp (8080), _telnet._tcp (23)");
+
+  return ESP_OK;
+}
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
 {
@@ -125,8 +175,10 @@ void app_main(void)
 {
   ESP_ERROR_CHECK(nvs_flash_init());
 
-  ESP_LOGI(TAG, "1) Connect WiFi using include/wifiCredentials.ini");
+  ESP_LOGI(TAG, "1a) Connect WiFi using include/wifiCredentials.ini");
   ESP_ERROR_CHECK(wifi_connect_from_credentials());
+  ESP_LOGI(TAG, "1b) Start mDNS");
+  ESP_ERROR_CHECK(mdns_start_advertising());
 
   ESP_LOGI(TAG, "2) Mount SD card");
   ESP_ERROR_CHECK(sdcard_mount());
@@ -161,4 +213,11 @@ void app_main(void)
   ESP_LOGI(TAG, "  HTTP:   POST http://<ip>:8080/sql");
   ESP_LOGI(TAG, "  Telnet: telnet <ip> 23");
   ESP_LOGI(TAG, "  DB: /sdcard/app.db");
-}
+
+    ESP_LOGI(TAG, "Ready.");
+  ESP_LOGI(TAG, "  Hostname: %s.local", HOSTNAME);
+  ESP_LOGI(TAG, "  HTTP:     POST http://%s.local:8080/sql", HOSTNAME);
+  ESP_LOGI(TAG, "  Telnet:   telnet %s.local 23", HOSTNAME);
+  ESP_LOGI(TAG, "  DB: /sdcard/app.db");
+
+} // app_main()
