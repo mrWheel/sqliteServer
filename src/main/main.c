@@ -2,6 +2,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 
 #include "esp_log.h"
 #include "esp_err.h"
@@ -15,8 +16,9 @@
 
 #include "sdcard.h"
 #include "sql_api.h"
-
 #include "http_file_server.h"
+
+#include "telnet_sqlite_console.h"
 
 // Include credentials (bestand staat in include/wifiCredentials.ini)
 #include "wifiCredentials.ini"
@@ -54,7 +56,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
 
 static esp_err_t wifi_connect_from_credentials(void)
 {
-    // Basic sanity: empty strings voorkomen
     if (strlen(WIFI_SSID) == 0) {
         ESP_LOGE(TAG, "WIFI_SSID is empty. Check include/wifiCredentials.ini");
         return ESP_ERR_INVALID_ARG;
@@ -71,7 +72,6 @@ static esp_err_t wifi_connect_from_credentials(void)
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    // Event handlers
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
@@ -81,7 +81,6 @@ static esp_err_t wifi_connect_from_credentials(void)
     strncpy((char *)wifi_config.sta.ssid, WIFI_SSID, sizeof(wifi_config.sta.ssid) - 1);
     strncpy((char *)wifi_config.sta.password, WIFI_PASS, sizeof(wifi_config.sta.password) - 1);
 
-    // Handig: voorkomt dat ESP32 blijft proberen met slechte settings
     wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
     wifi_config.sta.pmf_cfg.capable = true;
     wifi_config.sta.pmf_cfg.required = false;
@@ -90,7 +89,6 @@ static esp_err_t wifi_connect_from_credentials(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    // Wacht tot connected of fail
     EventBits_t bits = xEventGroupWaitBits(
         s_wifi_event_group,
         WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
@@ -122,8 +120,6 @@ void app_main(void)
     ESP_LOGI(TAG, "2) Mount SD card");
     ESP_ERROR_CHECK(sdcard_mount());
 
-    // === SQLite crash fix ===
-    // Als SQLite met OMIT_AUTOINIT is gebouwd, moet je dit expliciet doen.
     ESP_LOGI(TAG, "3) sqlite3_initialize()");
     int irc = sqlite3_initialize();
     if (irc != SQLITE_OK) {
@@ -135,8 +131,21 @@ void app_main(void)
     sqlite3 *db = NULL;
     ESP_ERROR_CHECK(sdcard_open_db("/sdcard/app.db", &db));
 
+    // 1 mutex voor telnet console (en eventueel later ook voor HTTP)
+    SemaphoreHandle_t db_mutex = xSemaphoreCreateMutex();
+    if (!db_mutex) {
+        ESP_LOGE(TAG, "Failed to create db mutex");
+        abort();
+    }
+
     ESP_LOGI(TAG, "5) Start SQL JSON REST API");
     ESP_ERROR_CHECK(sql_api_start(db));
 
-    ESP_LOGI(TAG, "Ready. POST /sql with JSON. DB=/sdcard/app.db");
+    ESP_LOGI(TAG, "6) Start Telnet SQLite console on port 23");
+    ESP_ERROR_CHECK(telnet_sqlite_console_start(db, db_mutex, 23));
+
+    ESP_LOGI(TAG, "Ready.");
+    ESP_LOGI(TAG, "  HTTP:   POST http://<ip>:8080/sql");
+    ESP_LOGI(TAG, "  Telnet: telnet <ip> 23");
+    ESP_LOGI(TAG, "  DB: /sdcard/app.db");
 }
