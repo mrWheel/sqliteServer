@@ -6,12 +6,13 @@
 #include "sqlite3.h"
 
 #ifdef __cplusplus
-extern "C" {
+extern "C"
+{
 #endif
 
-// Start telnet sqlite console op TCP port (aanrader: 2323)
-// Last client wins: nieuwe connect => bestaande client wordt afgesloten.
-esp_err_t telnet_sqlite_console_start(sqlite3 *db, SemaphoreHandle_t db_mutex, int port);
+  // Start telnet sqlite console op TCP port (aanrader: 2323)
+  // Last client wins: nieuwe connect => bestaande client wordt afgesloten.
+  esp_err_t telnet_sqlite_console_start(sqlite3* db, SemaphoreHandle_t db_mutex, int port);
 
 #ifdef __cplusplus
 }
