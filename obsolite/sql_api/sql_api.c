@@ -13,7 +13,7 @@
 #include "esp_system.h"
 #include "nvs_flash.h"
 
-#include "http_file_server.h" // <-- JOUW component (niet https_file_server.h)
+//-x-#include "http_file_server.h" // <-- JOUW component (niet https_file_server.h)
 
 static const char* TAG = "SQLAPI";
 
@@ -412,6 +412,7 @@ esp_err_t sql_api_start(sqlite3* db)
     return ESP_FAIL;
   }
 
+  /**** 
   // --- API handlers ---
   httpd_uri_t sql_uri = {
       .uri = "/sql",
@@ -430,7 +431,7 @@ esp_err_t sql_api_start(sqlite3* db)
   // --- Static file server (SPIFFS/LittleFS data/) ---
   // Zorg dat je FS gemount is op "/spiffs" voordat je dit aanroept.
   http_file_server_config_t fcfg = {
-      .base_path = "/spiffs",
+      .base_path = "/spiffs//-x-",
       .uri_prefix = "/static",
       .index_path = "/index.html",
       .cache_control_no_store = true};
@@ -445,9 +446,9 @@ esp_err_t sql_api_start(sqlite3* db)
     ESP_LOGI(TAG, "  GET  http://<ip>:8080/            (index.html)");
     ESP_LOGI(TAG, "  GET  http://<ip>:8080/static/...  (assets)");
   }
-
+  ***/
   ESP_LOGI(TAG, "SQL API ready:");
-  ESP_LOGI(TAG, "  POST http://<ip>:8080/sql  body: {\"sql\":\"SELECT 1;\"}");
+  //-x-ESP_LOGI(TAG, "  POST http://<ip>:8080/sql  body: {\"sql\":\"SELECT 1;\"}");
   ESP_LOGI(TAG, "  POST http://<ip>:8080/wifi/save body: {\"ssid\":\"...\",\"pass\":\"...\"}");
 
   return ESP_OK;

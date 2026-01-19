@@ -16,8 +16,8 @@
 #include "sqlite3.h"
 
 #include "sdcard.h"
-#include "sql_api.h"
-#include "http_file_server.h"
+//-x-#include "sql_api.h"
+//-x-#include "http_file_server.h"
 
 #include "telnet_sqlite_console.h"
 
@@ -56,17 +56,20 @@ static esp_err_t mdns_start_advertising(void)
     return err;
   }
 
+  /*** 
   //-- HTTP REST API service: http://<hostname>.local:8080/sql
   mdns_txt_item_t http_txt[] =
   {
     { "path", "/sql" }
   };
+
   err = mdns_service_add("SQLite HTTP API", "_http", "_tcp", 8080, http_txt, 1);
   if (err != ESP_OK)
   {
     ESP_LOGE(TAG, "mdns_service_add(_http) failed: %s", esp_err_to_name(err));
     return err;
   }
+  ****/
 
   //-- Telnet service: telnet <hostname>.local 23
   err = mdns_service_add("SQLite Telnet Console", "_telnet", "_tcp", 23, NULL, 0);
@@ -77,7 +80,8 @@ static esp_err_t mdns_start_advertising(void)
   }
 
   ESP_LOGI(TAG, "mDNS started: %s.local", HOSTNAME);
-  ESP_LOGI(TAG, "mDNS services: _http._tcp (8080), _telnet._tcp (23)");
+  //-x-ESP_LOGI(TAG, "mDNS services: _http._tcp (8080), _telnet._tcp (23)");
+  ESP_LOGI(TAG, "mDNS services:  _telnet._tcp (23)");
 
   return ESP_OK;
 }
@@ -203,20 +207,20 @@ void app_main(void)
     abort();
   }
 
-  ESP_LOGI(TAG, "5) Start SQL JSON REST API");
-  ESP_ERROR_CHECK(sql_api_start(db));
+  //-x-ESP_LOGI(TAG, "5) Start SQL JSON REST API");
+  //-x-ESP_ERROR_CHECK(sql_api_start(db));
 
   ESP_LOGI(TAG, "6) Start Telnet SQLite console on port 23");
   ESP_ERROR_CHECK(telnet_sqlite_console_start(db, db_mutex, 23));
 
   ESP_LOGI(TAG, "Ready.");
-  ESP_LOGI(TAG, "  HTTP:   POST http://<ip>:8080/sql");
+  //-x-ESP_LOGI(TAG, "  HTTP:   POST http://<ip>:8080/sql");
   ESP_LOGI(TAG, "  Telnet: telnet <ip> 23");
   ESP_LOGI(TAG, "  DB: /sdcard/app.db");
 
     ESP_LOGI(TAG, "Ready.");
   ESP_LOGI(TAG, "  Hostname: %s.local", HOSTNAME);
-  ESP_LOGI(TAG, "  HTTP:     POST http://%s.local:8080/sql", HOSTNAME);
+  //-x-ESP_LOGI(TAG, "  HTTP:     POST http://%s.local:8080/sql", HOSTNAME);
   ESP_LOGI(TAG, "  Telnet:   telnet %s.local 23", HOSTNAME);
   ESP_LOGI(TAG, "  DB: /sdcard/app.db");
 
