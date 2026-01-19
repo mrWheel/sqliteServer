@@ -248,6 +248,7 @@ static int recv_filtered(int fd, unsigned char* out, int outlen)
     return r;
 
   // debug (optioneel): alleen loggen als er minimaal 4 bytes zijn
+  /*** 
   if (r >= 4)
   {
     ESP_LOGI(TAG, "rx %d bytes, first=%02X %02X %02X %02X",
@@ -257,6 +258,7 @@ static int recv_filtered(int fd, unsigned char* out, int outlen)
   {
     ESP_LOGI(TAG, "rx %d bytes, first=%02X", r, b[0]);
   }
+  ***/
   int w = 0;
 
   for (int i = 0; i < r && w < outlen; i++)
