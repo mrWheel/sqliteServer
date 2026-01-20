@@ -182,11 +182,12 @@ def main() -> None:
     ap.add_argument("--log-level", choices=["error", "info", "debug"], default="info", help="Logging verbosity")
     ap.add_argument("--timeout", type=float, default=5.0, help="Per request timeout seconds")
     ap.add_argument("--limit", type=int, default=0, help="Optional limit number of persons (0 = all)")
-    ap.add_argument("--wide", action="store_true", help="Wide table layout (default is 80 columns)")
+    ap.add_argument("--wide", type=int, default=80, help="Table width in columns (default: 80)")
     args = ap.parse_args()
 
     LOG_LEVEL = {"error": LOG_ERROR, "info": LOG_INFO, "debug": LOG_DEBUG}[args.log_level]
 
+    table_width = args.wide 
     host, port, timeout = args.host, args.port, args.timeout
 
     # -------- date helpers --------
@@ -216,21 +217,19 @@ def main() -> None:
             return s[:width]
         return s[: width - 3] + "..."
 
-    if args.wide:
+    if table_width >= 100:
         COLS = [
-        #   ("id", "id", 5, "r"),
             ("naam", "naam", 28, "l"),
             ("geboorte_fmt", "geboorte", 10, "l"),
             ("leeftijd", "leeftijd", 8, "r"),
             ("woonplaats", "woonplaats", 16, "l"),
-            ("opleiding", "opl", 6, "c"),
+            ("opleiding", "opl", 10, "c"),
             ("functie", "functie", 36, "l"),
             ("categorie", "categorie", 28, "l"),
-            ("ervaring_jaren", "ervaring", 8, "r"),   # ← rechts
+            ("ervaring_jaren", "ervaring", 8, "r"),
         ]
     else:
         COLS = [
-        #   ("id", "id", 4, "r"),
             ("naam", "naam", 24, "l"),
             ("geboorte_fmt", "geboorte", 10, "l"),
             ("leeftijd", "leeftijd", 8, "r"),
@@ -238,7 +237,7 @@ def main() -> None:
             ("opleiding", "opl", 5, "c"),
             ("functie", "functie", 28, "l"),
             ("categorie", "categorie", 22, "l"),
-            ("ervaring_jaren", "ervaring", 8, "r"),   # ← rechts uitgelijnd
+            ("ervaring_jaren", "ervaring", 8, "r"),
         ]
     WIDTHS = [w for _, _, w, _ in COLS]
     ALIGNS = [a for _, _, _, a in COLS]
@@ -334,16 +333,22 @@ def main() -> None:
 
                 gb_date = parse_ymd(str(geboortedatum))
                 erv_date = parse_ymd(str(ervaring_sinds))
+                opl_code = str(opleiding)
+                opl_oms = fetch_single_text(
+                    sock, f,
+                    "SELECT omschrijving FROM onderwijsniveau WHERE code=" + sql_quote(opl_code) + " LIMIT 1",
+                    timeout=timeout
+                ) or ""
 
+                opleiding_str = f"{opl_code} - {opl_oms}" if opl_oms else opl_code
                 person = {
-                #   "id": str(pid),
                     "voornaam": str(voornaam),
                     "achternaam": str(achternaam),
                     "naam": f"{achternaam}, {voornaam}",
                     "geboorte_fmt": fmt_ddmmyyyy(gb_date),
                     "leeftijd": years_between(gb_date, today),
                     "woonplaats": str(woonplaats),
-                    "opleiding": str(opleiding),
+                    "opleiding": opleiding_str,
                     "functie": f"{functie_code_str} - {f_oms}",
                     "categorie": f"{cat_code} - {cat_oms}" if (cat_code or cat_oms) else "",
                     "ervaring_jaren": years_between(erv_date, today),
@@ -372,5 +377,4 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         log_error(f"{type(e).__name__}: {e}")
-        raise
-    
+        sys.exit(1)   

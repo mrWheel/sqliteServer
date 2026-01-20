@@ -227,7 +227,12 @@ def make_sql_lists(insert_prefix: str) -> Dict[str, List[str]]:
     ]
 
     sqls["functie"] = [
-        insert_sql(insert_prefix, "functie", "code, omschrijving, categorie_code", f"{sql_quote(code)},{sql_quote(oms)},{sql_quote(cat)}")
+        insert_sql(
+            insert_prefix,
+            "functie",
+            "code, omschrijving, categorie_code",
+            f"{sql_quote(code)},{sql_quote(oms)},{sql_quote(cat)}"
+        )
         for code, oms, cat in FUNCTIES
     ]
 
@@ -249,9 +254,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Create/seed ESP32 sqlite-tcp-v1 tables.")
     ap.add_argument("--host", default="192.168.12.14", help="Server IP/hostname")
     ap.add_argument("--port", type=int, default=5555, help="Server port")
-    ap.add_argument("--timeout", type=float, default=5.0, help="Per request timeout seconds")
+    ap.add_argument("--timeout", type=float, default=10.0, help="Per request timeout seconds")
     ap.add_argument("--log-level", choices=["error", "info", "debug"], default="info", help="Logging verbosity")
     ap.add_argument("--no-drop", action="store_true", help="Do not DROP TABLEs first (idempotent seeding)")
+    ap.add_argument("--no-refresh-personen", action="store_true", help="When --no-drop: do NOT delete persoon before seeding")
     ap.add_argument("--upsert", action="store_true", help="Use INSERT OR REPLACE instead of INSERT OR IGNORE when --no-drop")
     ap.add_argument("--tables", default="all", help="Comma separated: all,persoon,functie,functie_categorie,onderwijsniveau")
     args = ap.parse_args()
@@ -290,23 +296,37 @@ def main() -> int:
         if not args.no_drop:
             log_info("Dropping tables (if exist) ...")
             t_drop0 = time.perf_counter()
+            log_info("--> Dropping persoon table ...")
             exec_sql(sock, f, "DROP TABLE IF EXISTS persoon;", args.timeout*2)
+            log_info("--> Dropping functie table ...")
             exec_sql(sock, f, "DROP TABLE IF EXISTS functie;", args.timeout*2)
+            log_info("--> Dropping functie_categorie table ...")
             exec_sql(sock, f, "DROP TABLE IF EXISTS functie_categorie;", args.timeout*2)
+            log_info("--> Dropping onderwijsniveau table ...")
             exec_sql(sock, f, "DROP TABLE IF EXISTS onderwijsniveau;", args.timeout*2)
             log_info(f"Drop done in {ms(time.perf_counter()-t_drop0)} ms")
 
-        # Create tables
+        # Create tables (Option 1: linkable codes, no constraints)
         log_info("Creating tables ...")
         t_create0 = time.perf_counter()
+
+        log_info("--> Creating onderwijsniveau table ...")
         exec_sql(sock, f, "CREATE TABLE IF NOT EXISTS onderwijsniveau (id INTEGER PRIMARY KEY, code TEXT NOT NULL, omschrijving TEXT NOT NULL);", args.timeout*2)
         exec_sql(sock, f, "CREATE UNIQUE INDEX IF NOT EXISTS idx_onderwijsniveau_code ON onderwijsniveau(code);", args.timeout*2)
+
+        log_info("--> Creating functie_categorie table ...")        
         exec_sql(sock, f, "CREATE TABLE IF NOT EXISTS functie_categorie (id INTEGER PRIMARY KEY, code TEXT NOT NULL, omschrijving TEXT NOT NULL);", args.timeout*2)
         exec_sql(sock, f, "CREATE UNIQUE INDEX IF NOT EXISTS idx_functie_categorie_code ON functie_categorie(code);", args.timeout*2)
+
+        # functie has categorie_code but NO FOREIGN KEY constraints
+        log_info("--> Creating functie table ...")
         exec_sql(sock, f, "CREATE TABLE IF NOT EXISTS functie (id INTEGER PRIMARY KEY, code TEXT NOT NULL, omschrijving TEXT NOT NULL, categorie_code TEXT NOT NULL);", args.timeout*2)
         exec_sql(sock, f, "CREATE UNIQUE INDEX IF NOT EXISTS idx_functie_code ON functie(code);", args.timeout*2)
         exec_sql(sock, f, "CREATE INDEX IF NOT EXISTS idx_functie_categorie_code ON functie(categorie_code);", args.timeout*2)
+
+        log_info("--> Creating persoon table ...")  
         exec_sql(sock, f, "CREATE TABLE IF NOT EXISTS persoon (id INTEGER PRIMARY KEY, voornaam TEXT NOT NULL, achternaam TEXT NOT NULL, geboortedatum TEXT NOT NULL, woonplaats TEXT NOT NULL, opleiding TEXT NOT NULL, functie TEXT NOT NULL, ervaring_sinds TEXT NOT NULL);", args.timeout*2)
+
         log_info(f"Create done in {ms(time.perf_counter()-t_create0)} ms")
 
         log_info(f"Seeding with '{insert_prefix}' for tables: {','.join(selected)}")
@@ -315,6 +335,10 @@ def main() -> int:
 
         # Seed selected tables, with per-10 progress times
         for table in selected:
+            if table == "persoon" and args.no_drop and not args.no_refresh_personen:
+                log_info("Refreshing persoon: DELETE FROM persoon;")
+                exec_sql(sock, f, "DELETE FROM persoon;", args.timeout * 2)
+
             run_batch(sock, f, args.timeout, f"Seed {table}", sql_lists[table], progress_every=10)
 
         log_info("All done.")
