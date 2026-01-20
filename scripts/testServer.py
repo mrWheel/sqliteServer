@@ -4,13 +4,14 @@ import json
 import socket
 import sys
 import time
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 PROTO = "sqlite-tcp-v1"
 
 SQL_PERSONEN = (
     "SELECT id,voornaam,achternaam,geboortedatum,woonplaats,opleiding,functie,ervaring_sinds "
-    "FROM persoon ORDER BY woonplaats,achternaam,voornaam"
+    "FROM persoon ORDER BY achternaam,voornaam"
 )
 
 # ---------- logging ----------
@@ -110,16 +111,15 @@ def fetch_single_text(sock: socket.socket, f, sql: str, timeout: float = 5.0) ->
 
 # ---------- pretty output (per person) ----------
 def print_person_card(person: Dict[str, str]) -> None:
-    # print direct per person; keep it simple + readable
     items = [
-        ("ID", person["id"]),
-        ("Naam", f'{person["voornaam"]} {person["achternaam"]}'),
-        ("Geboorte", person["geboortedatum"]),
-        ("Woonplaats", person["woonplaats"]),
-        ("Opleiding", person["opleiding"]),
-        ("Functie", person["functie"]),
-        ("Categorie", person["categorie"]),
-        ("Ervaring sinds", person["ervaring_sinds"]),
+        ("ID", person.get("id", "")),
+        ("Naam", f'{person.get("achternaam","")}, {person.get("voornaam","")}'.strip() or person.get("naam","")),
+        ("Geboorte", f'{person.get("geboorte_fmt","")} (leeftijd {person.get("leeftijd","")})'.strip()),
+        ("Woonplaats", person.get("woonplaats", "")),
+        ("Opleiding", person.get("opleiding", "")),
+        ("Functie", person.get("functie", "")),
+        ("Categorie", person.get("categorie", "")),
+        ("Ervaring", f'{person.get("ervaring_jaren","")} jaar'.strip()),
     ]
     width = max(len(k) for k, _ in items)
     print("+" + "-" * (width + 2) + "+" + "-" * 62 + "+")
@@ -132,6 +132,7 @@ def print_person_card(person: Dict[str, str]) -> None:
     print("+" + "-" * (width + 2) + "+" + "-" * 62 + "+")
     print("", flush=True)
 
+
 def clip(s: str, width: int) -> str:
     s = "" if s is None else str(s)
     if width <= 1:
@@ -141,7 +142,7 @@ def clip(s: str, width: int) -> str:
 def print_person_list_table(rows: List[Dict[str, str]]) -> None:
     # Kolommen + max breedtes (pas gerust aan)
     cols = [
-        ("id", "id", 4),
+      # ("id", "id", 4),
         ("naam", "naam", 24),
         ("geboortedatum", "geboortedatum", 10),
         ("woonplaats", "woonplaats", 14),
@@ -188,6 +189,24 @@ def main() -> None:
 
     host, port, timeout = args.host, args.port, args.timeout
 
+    # -------- date helpers --------
+    def parse_ymd(s: str) -> Optional[date]:
+        if not s:
+            return None
+        try:
+            return datetime.strptime(str(s), "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+    def fmt_ddmmyyyy(d: Optional[date]) -> str:
+        return d.strftime("%d-%m-%Y") if d else ""
+
+    def years_between(d: Optional[date], today: date) -> str:
+        if not d:
+            return ""
+        y = today.year - d.year - ((today.month, today.day) < (d.month, d.day))
+        return str(y)
+
     # -------- output helpers (streaming, fixed widths) --------
     def clip(s: str, width: int) -> str:
         s = "" if s is None else str(s)
@@ -199,47 +218,65 @@ def main() -> None:
 
     if args.wide:
         COLS = [
-            ("id", "id", 5),
-            ("naam", "naam", 28),
-            ("geboortedatum", "geboorte", 10),
-            ("woonplaats", "woonplaats", 16),
-            ("opleiding", "opl", 6),
-            ("functie", "functie", 36),
-            ("categorie", "categorie", 28),
-            ("ervaring_sinds", "erv.sinds", 10),
+        #   ("id", "id", 5, "r"),
+            ("naam", "naam", 28, "l"),
+            ("geboorte_fmt", "geboorte", 10, "l"),
+            ("leeftijd", "leeftijd", 8, "r"),
+            ("woonplaats", "woonplaats", 16, "l"),
+            ("opleiding", "opl", 6, "c"),
+            ("functie", "functie", 36, "l"),
+            ("categorie", "categorie", 28, "l"),
+            ("ervaring_jaren", "ervaring", 8, "r"),   # ← rechts
         ]
     else:
         COLS = [
-            ("id", "id", 4),
-            ("naam", "naam", 24),
-            ("geboortedatum", "geboorte", 10),
-            ("woonplaats", "woonplaats", 14),
-            ("opleiding", "opl", 5),
-            ("functie", "functie", 28),
-            ("categorie", "categorie", 22),
-            ("ervaring_sinds", "erv.sinds", 10),
+        #   ("id", "id", 4, "r"),
+            ("naam", "naam", 24, "l"),
+            ("geboorte_fmt", "geboorte", 10, "l"),
+            ("leeftijd", "leeftijd", 8, "r"),
+            ("woonplaats", "woonplaats", 14, "l"),
+            ("opleiding", "opl", 5, "c"),
+            ("functie", "functie", 28, "l"),
+            ("categorie", "categorie", 22, "l"),
+            ("ervaring_jaren", "ervaring", 8, "r"),   # ← rechts uitgelijnd
         ]
+    WIDTHS = [w for _, _, w, _ in COLS]
+    ALIGNS = [a for _, _, _, a in COLS]
 
-    WIDTHS = [w for _, _, w in COLS]
-
-    def fmt_line(values):
+    def fmt_line(values: List[str]) -> str:
         parts = []
         for i, v in enumerate(values):
-            parts.append(clip(v, WIDTHS[i]).ljust(WIDTHS[i]))
+            txt = clip(v, WIDTHS[i])
+            a = ALIGNS[i]
+            if a == "r":
+                parts.append(txt.rjust(WIDTHS[i]))
+            elif a == "c":
+                parts.append(txt.center(WIDTHS[i]))
+            else:
+                parts.append(txt.ljust(WIDTHS[i]))
         return "| " + " | ".join(parts) + " |"
 
-    def print_header():
-        headers = [h for _, h, _ in COLS]
-        print(fmt_line(headers))
+
+    def print_header_once() -> None:
+        headers = [h for _, h, _, _ in COLS]
+        header_parts = []
+        for i, h in enumerate(headers):
+            w = WIDTHS[i]
+            a = ALIGNS[i]
+            if a == "c":
+                header_parts.append(h.center(w))
+            else:
+                header_parts.append(h.ljust(w))
+        print("| " + " | ".join(header_parts) + " |")
         print("|-" + "-|-".join("-" * w for w in WIDTHS) + "-|")
         sys.stdout.flush()
 
-    def print_row(person):
-        values = [person.get(k, "") for k, _, _ in COLS]
+    def print_row(person: Dict[str, str]) -> None:
+        values = [person.get(k, "") for k, _, _, _ in COLS]
         print(fmt_line(values))
         sys.stdout.flush()
 
-    # -------- connect --------
+    # -------- connect & query --------
     log_info(f"Connecting to {host}:{port} ...")
     t_start = time.perf_counter()
 
@@ -258,6 +295,7 @@ def main() -> None:
 
         count = 0
         header_printed = False
+        today = date.today()
 
         try:
             while True:
@@ -265,10 +303,15 @@ def main() -> None:
                 if prow is None:
                     break
 
+                if len(prow) < 8:
+                    log_error(f"Row has {len(prow)} cols, expected 8. raw={jshort(prow)}")
+                    continue
+
                 count += 1
                 pid, voornaam, achternaam, geboortedatum, woonplaats, opleiding, functie_code, ervaring_sinds = prow
                 functie_code_str = "" if functie_code is None else str(functie_code)
 
+                # Lookups without JOIN
                 f_oms = fetch_single_text(
                     sock, f,
                     "SELECT omschrijving FROM functie WHERE code=" + sql_quote(functie_code_str) + " LIMIT 1",
@@ -289,24 +332,29 @@ def main() -> None:
                         timeout=timeout
                     ) or ""
 
+                gb_date = parse_ymd(str(geboortedatum))
+                erv_date = parse_ymd(str(ervaring_sinds))
+
                 person = {
-                    "id": str(pid),
+                #   "id": str(pid),
                     "voornaam": str(voornaam),
                     "achternaam": str(achternaam),
-                    "naam": f"{voornaam} {achternaam}",
-                    "geboortedatum": geboortedatum,
-                    "woonplaats": woonplaats,
-                    "opleiding": opleiding,
+                    "naam": f"{achternaam}, {voornaam}",
+                    "geboorte_fmt": fmt_ddmmyyyy(gb_date),
+                    "leeftijd": years_between(gb_date, today),
+                    "woonplaats": str(woonplaats),
+                    "opleiding": str(opleiding),
                     "functie": f"{functie_code_str} - {f_oms}",
-                    "categorie": f"{cat_code} - {cat_oms}" if cat_code or cat_oms else "",
-                    "ervaring_sinds": ervaring_sinds,
+                    "categorie": f"{cat_code} - {cat_oms}" if (cat_code or cat_oms) else "",
+                    "ervaring_jaren": years_between(erv_date, today),
                 }
 
+                # Output mode:
                 if LOG_LEVEL >= LOG_DEBUG:
                     print_person_card(person)
                 else:
                     if not header_printed:
-                        print_header()
+                        print_header_once()
                         header_printed = True
                     print_row(person)
 

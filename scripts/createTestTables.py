@@ -152,14 +152,14 @@ PERSONEN: List[Tuple[str, str, str, str, str, str, str]] = [
     ("Sanne","Jansen","1992-11-02","Rotterdam","MBO","ADM","2013-07-01"),
     ("Daan","van Dijk","1989-06-21","Den Haag","WO","DEV","2012-02-01"),
     ("Lisa","Bakker","1996-01-09","Utrecht","HBO","HRM","2017-06-01"),
-    ("Mohamed","Visser","1984-09-30","Eindhoven","MBO","CHD","2006-05-01"),
+    ("Mohamed","Visser","1984-09-30","Eindhoven","BO","CHD","2006-05-01"),
     ("Noa","Smit","1999-04-18","Tilburg","MBO","KSD","2019-09-01"),
     ("Thomas","Meijer","1979-12-07","Groningen","HBO","CTL","2003-03-01"),
     ("Eva","de Jong","1991-08-25","Almere","HBO","MKT","2014-01-01"),
     ("Ruben","Mulder","1987-02-11","Nijmegen","MBO","MNT","2008-08-01"),
     ("Fleur","de Boer","1994-10-05","Arnhem","HBO","REC","2016-04-01"),
     ("Jesse","van Leeuwen","1988-08-14","Haarlem","HBO","SAD","2011-04-01"),
-    ("Lotte","Dekker","1997-12-22","Amersfoort","MBO","BAL","2018-08-01"),
+    ("Lotte","Dekker","1997-12-22","Amersfoort","LBO","BAL","2018-08-01"),
     ("Ahmed","van der Meer","1990-06-02","Breda","HBO","ACM","2012-09-01"),
     ("Iris","van den Berg","1983-10-11","Apeldoorn","WO","JUR","2008-01-01"),
     ("Mark","Vos","1985-01-16","Enschede","MBO","OPR","2007-09-01"),
@@ -189,7 +189,7 @@ PERSONEN: List[Tuple[str, str, str, str, str, str, str]] = [
     ("Ilse","van der Pol","1996-08-08","Maastricht","HBO","DEV","2018-07-01"),
     ("Niek","van der Linden","1983-01-12","Dordrecht","MBO","CHD","2005-09-01"),
     ("Aylin","de Vries","1997-04-04","Amsterdam","HBO","KSD","2018-09-01"),
-    ("Sem","Jansen","2000-09-20","Rotterdam","MBO","LOG","2020-10-01"),
+    ("Sem","Jansen","2000-09-20","Rotterdam","BO","LOG","2020-10-01"),
     ("Nora","van Dijk","1991-12-01","Den Haag","HBO","FIN","2013-09-01"),
     ("Kasper","Bakker","1989-05-23","Utrecht","MBO","TCH","2011-02-01"),
     ("Sofia","Visser","1998-02-14","Eindhoven","HBO","ADM","2019-03-01"),
@@ -299,14 +299,14 @@ def main() -> int:
         # Create tables
         log_info("Creating tables ...")
         t_create0 = time.perf_counter()
-        exec_sql(sock, f, "CREATE TABLE IF NOT EXISTS onderwijsniveau (id INTEGER PRIMARY KEY, code TEXT NOT NULL, omschrijving TEXT NOT NULL);", args.timeout)
-        exec_sql(sock, f, "CREATE UNIQUE INDEX IF NOT EXISTS idx_onderwijsniveau_code ON onderwijsniveau(code);", args.timeout)
-        exec_sql(sock, f, "CREATE TABLE IF NOT EXISTS functie_categorie (id INTEGER PRIMARY KEY, code TEXT NOT NULL, omschrijving TEXT NOT NULL);", args.timeout)
-        exec_sql(sock, f, "CREATE UNIQUE INDEX IF NOT EXISTS idx_functie_categorie_code ON functie_categorie(code);", args.timeout)
-        exec_sql(sock, f, "CREATE TABLE IF NOT EXISTS functie (id INTEGER PRIMARY KEY, code TEXT NOT NULL, omschrijving TEXT NOT NULL, categorie_code TEXT NOT NULL);", args.timeout)
-        exec_sql(sock, f, "CREATE UNIQUE INDEX IF NOT EXISTS idx_functie_code ON functie(code);", args.timeout)
-        exec_sql(sock, f, "CREATE INDEX IF NOT EXISTS idx_functie_categorie_code ON functie(categorie_code);", args.timeout)
-        exec_sql(sock, f, "CREATE TABLE IF NOT EXISTS persoon (id INTEGER PRIMARY KEY, voornaam TEXT NOT NULL, achternaam TEXT NOT NULL, geboortedatum TEXT NOT NULL, woonplaats TEXT NOT NULL, opleiding TEXT NOT NULL, functie TEXT NOT NULL, ervaring_sinds TEXT NOT NULL);", args.timeout)
+        exec_sql(sock, f, "CREATE TABLE IF NOT EXISTS onderwijsniveau (id INTEGER PRIMARY KEY, code TEXT NOT NULL, omschrijving TEXT NOT NULL);", args.timeout*2)
+        exec_sql(sock, f, "CREATE UNIQUE INDEX IF NOT EXISTS idx_onderwijsniveau_code ON onderwijsniveau(code);", args.timeout*2)
+        exec_sql(sock, f, "CREATE TABLE IF NOT EXISTS functie_categorie (id INTEGER PRIMARY KEY, code TEXT NOT NULL, omschrijving TEXT NOT NULL);", args.timeout*2)
+        exec_sql(sock, f, "CREATE UNIQUE INDEX IF NOT EXISTS idx_functie_categorie_code ON functie_categorie(code);", args.timeout*2)
+        exec_sql(sock, f, "CREATE TABLE IF NOT EXISTS functie (id INTEGER PRIMARY KEY, code TEXT NOT NULL, omschrijving TEXT NOT NULL, categorie_code TEXT NOT NULL);", args.timeout*2)
+        exec_sql(sock, f, "CREATE UNIQUE INDEX IF NOT EXISTS idx_functie_code ON functie(code);", args.timeout*2)
+        exec_sql(sock, f, "CREATE INDEX IF NOT EXISTS idx_functie_categorie_code ON functie(categorie_code);", args.timeout*2)
+        exec_sql(sock, f, "CREATE TABLE IF NOT EXISTS persoon (id INTEGER PRIMARY KEY, voornaam TEXT NOT NULL, achternaam TEXT NOT NULL, geboortedatum TEXT NOT NULL, woonplaats TEXT NOT NULL, opleiding TEXT NOT NULL, functie TEXT NOT NULL, ervaring_sinds TEXT NOT NULL);", args.timeout*2)
         log_info(f"Create done in {ms(time.perf_counter()-t_create0)} ms")
 
         log_info(f"Seeding with '{insert_prefix}' for tables: {','.join(selected)}")
