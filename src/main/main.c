@@ -16,10 +16,10 @@
 #include "sqlite3.h"
 
 #include "sdcard.h"
-//-x-#include "sql_api.h"
-//-x-#include "http_file_server.h"
 
 #include "telnet_sqlite_console.h"
+
+#include "tcp_sqlite_server.h"
 
 // Include credentials (bestand staat in include/wifiCredentials.ini)
 #include "wifiCredentials.ini"
@@ -80,7 +80,6 @@ static esp_err_t mdns_start_advertising(void)
   }
 
   ESP_LOGI(TAG, "mDNS started: %s.local", HOSTNAME);
-  //-x-ESP_LOGI(TAG, "mDNS services: _http._tcp (8080), _telnet._tcp (23)");
   ESP_LOGI(TAG, "mDNS services:  _telnet._tcp (23)");
 
   return ESP_OK;
@@ -207,20 +206,30 @@ void app_main(void)
     abort();
   }
 
-  //-x-ESP_LOGI(TAG, "5) Start SQL JSON REST API");
-  //-x-ESP_ERROR_CHECK(sql_api_start(db));
+  // Start NDJSON TCP SQLite protocol server (bijv. op 5555)
+  tcp_sqlite_server_cfg_t cfg = {
+    .port = 5555,
+    .max_clients = 2,
+    .max_stmts_per_client = 8,
+    .rx_line_max = 2048,
+    .tx_line_max = 4096,
+    .client_task_stack = 8192,
+    .client_task_prio = 5
+  };
+
+  ESP_LOGI(TAG, "7) Start SQLite TCP protocol server on port %d", cfg.port);
+  ESP_ERROR_CHECK(tcp_sqlite_server_start(db, db_mutex, &cfg));
 
   ESP_LOGI(TAG, "6) Start Telnet SQLite console on port 23");
   ESP_ERROR_CHECK(telnet_sqlite_console_start(db, db_mutex, 23));
 
   ESP_LOGI(TAG, "Ready.");
-  //-x-ESP_LOGI(TAG, "  HTTP:   POST http://<ip>:8080/sql");
+  ESP_LOGI(TAG, "  SQL TCP:  nc %s.local 5555", HOSTNAME);
   ESP_LOGI(TAG, "  Telnet: telnet <ip> 23");
   ESP_LOGI(TAG, "  DB: /sdcard/app.db");
 
     ESP_LOGI(TAG, "Ready.");
   ESP_LOGI(TAG, "  Hostname: %s.local", HOSTNAME);
-  //-x-ESP_LOGI(TAG, "  HTTP:     POST http://%s.local:8080/sql", HOSTNAME);
   ESP_LOGI(TAG, "  Telnet:   telnet %s.local 23", HOSTNAME);
   ESP_LOGI(TAG, "  DB: /sdcard/app.db");
 
