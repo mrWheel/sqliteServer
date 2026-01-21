@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 PROTO = "sqlite-tcp-v1"
 
 SQL_PERSONEN = (
-    "SELECT id,voornaam,achternaam,geboortedatum,woonplaats,opleiding,functie,ervaring_sinds "
+    "SELECT id,voornaam,achternaam,geboortedatum,woonplaats,opleiding,functie,ervaring_sinds, inkomen "
     "FROM persoon ORDER BY achternaam,voornaam"
 )
 
@@ -35,6 +35,18 @@ def log_info(msg: str) -> None:
 def log_debug(msg: str) -> None:
     if LOG_LEVEL >= LOG_DEBUG:
         print(f"[{ts()}] DEBUG {msg}", file=sys.stderr, flush=True)
+
+# ---------- formatting helpers ----------
+def fmt_eur(v: Any) -> str:
+    if v is None:
+        return ""
+    try:
+        n = int(float(v))
+    except (ValueError, TypeError):
+        return str(v)
+    s = f"{n:,}".replace(",", ".")
+    return f"€ {s}"
+
 
 def jshort(obj: Any, limit: int = 260) -> str:
     s = json.dumps(obj, ensure_ascii=False)
@@ -110,26 +122,31 @@ def fetch_single_text(sock: socket.socket, f, sql: str, timeout: float = 5.0) ->
         finalize(sock, f, stmt, timeout=timeout)
 
 # ---------- pretty output (per person) ----------
-def print_person_card(person: Dict[str, str]) -> None:
+def print_person_card(person: Dict[str, Any]) -> None:
+    # Card always shows full info (codes + descriptions)
     items = [
         ("ID", person.get("id", "")),
-        ("Naam", f'{person.get("achternaam","")}, {person.get("voornaam","")}'.strip() or person.get("naam","")),
+        ("Naam", person.get("naam", "")),
         ("Geboorte", f'{person.get("geboorte_fmt","")} (leeftijd {person.get("leeftijd","")})'.strip()),
         ("Woonplaats", person.get("woonplaats", "")),
-        ("Opleiding", person.get("opleiding", "")),
-        ("Functie", person.get("functie", "")),
-        ("Categorie", person.get("categorie", "")),
-        ("Ervaring", f'{person.get("ervaring_jaren","")} jaar'.strip()),
+        ("Opleiding", f'{person.get("opleiding_code","")} - {person.get("opleiding_oms","")}'.strip(" -")),
+        ("Functie", f'{person.get("functie_code","")} - {person.get("functie_oms","")}'.strip(" -")),
+        ("Categorie", f'{person.get("categorie_code","")} - {person.get("categorie_oms","")}'.strip(" -")),
+        ("Ervaring", f'{person.get("ervaring_jaren","")} jaar (sinds {person.get("ervaring_sinds_fmt","")})'.strip()),
+        ("Inkomen", person.get("inkomen_fmt", "")),
     ]
-    width = max(len(k) for k, _ in items)
-    print("+" + "-" * (width + 2) + "+" + "-" * 62 + "+")
+
+    left_w = max(len(k) for k, _ in items)
+    right_w = 74  # card width; adjust if you want
+
+    print("+" + "-" * (left_w + 2) + "+" + "-" * (right_w + 2) + "+")
     for k, v in items:
-        left = f" {k.ljust(width)} "
-        right = f" {v}"
-        if len(right) > 62:
-            right = right[:59] + "..."
-        print("|" + left + "|" + right.ljust(62) + "|")
-    print("+" + "-" * (width + 2) + "+" + "-" * 62 + "+")
+        vv = "" if v is None else str(v)
+        # truncate right side
+        if len(vv) > right_w:
+            vv = vv[: max(0, right_w - 3)] + "..."
+        print("| " + k.ljust(left_w) + " | " + vv.ljust(right_w) + " |")
+    print("+" + "-" * (left_w + 2) + "+" + "-" * (right_w + 2) + "+")
     print("", flush=True)
 
 
@@ -180,17 +197,21 @@ def main() -> None:
     ap.add_argument("--host", default="192.168.12.14", help="Server IP/hostname")
     ap.add_argument("--port", type=int, default=5555, help="Server port")
     ap.add_argument("--log-level", choices=["error", "info", "debug"], default="info", help="Logging verbosity")
-    ap.add_argument("--timeout", type=float, default=5.0, help="Per request timeout seconds")
+    ap.add_argument("--timeout", type=float, default=10.0, help="Per request timeout seconds")
     ap.add_argument("--limit", type=int, default=0, help="Optional limit number of persons (0 = all)")
-    ap.add_argument("--wide", type=int, default=80, help="Table width in columns (default: 80)")
+    ap.add_argument("--wide", action="store_true", help="Wide output (fixed widths, descriptions only)")
     args = ap.parse_args()
 
     LOG_LEVEL = {"error": LOG_ERROR, "info": LOG_INFO, "debug": LOG_DEBUG}[args.log_level]
-
-    table_width = args.wide 
     host, port, timeout = args.host, args.port, args.timeout
 
-    # -------- date helpers --------
+    debug_cards = (LOG_LEVEL >= LOG_DEBUG)  # <-- override switch
+
+    sql_personen = (
+        "SELECT id,voornaam,achternaam,geboortedatum,woonplaats,opleiding,functie,categorie,ervaring_sinds,inkomen "
+        "FROM persoon ORDER BY achternaam,voornaam"
+    )
+
     def parse_ymd(s: str) -> Optional[date]:
         if not s:
             return None
@@ -208,8 +229,7 @@ def main() -> None:
         y = today.year - d.year - ((today.month, today.day) < (d.month, d.day))
         return str(y)
 
-    # -------- output helpers (streaming, fixed widths) --------
-    def clip(s: str, width: int) -> str:
+    def clip_local(s: Any, width: int) -> str:
         s = "" if s is None else str(s)
         if len(s) <= width:
             return s
@@ -217,35 +237,41 @@ def main() -> None:
             return s[:width]
         return s[: width - 3] + "..."
 
-    if table_width >= 100:
+    # ---- table layouts (only used when NOT debug_cards) ----
+    if args.wide:
+        # wide: descriptions only
         COLS = [
-            ("naam", "naam", 28, "l"),
-            ("geboorte_fmt", "geboorte", 10, "l"),
-            ("leeftijd", "leeftijd", 8, "r"),
-            ("woonplaats", "woonplaats", 16, "l"),
-            ("opleiding", "opl", 10, "c"),
-            ("functie", "functie", 36, "l"),
-            ("categorie", "categorie", 28, "l"),
-            ("ervaring_jaren", "ervaring", 8, "r"),
+            ("naam",       "naam",       26, "l"),
+            ("geboorte",   "geboorte",    10, "l"),
+            ("leeftijd",   "leeftijd",     8, "r"),
+            ("woonplaats", "woonplaats",  14, "l"),
+            ("opleiding",  "opleiding",   32, "l"),
+            ("functie",    "functie",     34, "l"),
+            ("categorie",  "categorie",   28, "l"),
+            ("ervaring",   "erv(jr)",      6, "r"),
+            ("inkomen",    "inkomen",     12, "r"),
         ]
     else:
+        # narrow: codes only
         COLS = [
-            ("naam", "naam", 24, "l"),
-            ("geboorte_fmt", "geboorte", 10, "l"),
-            ("leeftijd", "leeftijd", 8, "r"),
-            ("woonplaats", "woonplaats", 14, "l"),
-            ("opleiding", "opl", 5, "c"),
-            ("functie", "functie", 28, "l"),
-            ("categorie", "categorie", 22, "l"),
-            ("ervaring_jaren", "ervaring", 8, "r"),
+            ("naam",          "naam",       24, "l"),
+            ("geboorte",      "geboorte",    10, "l"),
+            ("leeftijd",      "leeftijd",     8, "r"),
+            ("woonplaats",    "woonplaats",  14, "l"),
+            ("opleiding_code","opl",          5, "c"),
+            ("functie_code",  "fnc",          5, "c"),
+            ("categorie_code","cat",          5, "c"),
+            ("ervaring",      "erv",          4, "r"),
+            ("inkomen",       "inkomen",     12, "r"),
         ]
+
     WIDTHS = [w for _, _, w, _ in COLS]
     ALIGNS = [a for _, _, _, a in COLS]
 
-    def fmt_line(values: List[str]) -> str:
-        parts = []
+    def fmt_line(values: List[Any]) -> str:
+        parts: List[str] = []
         for i, v in enumerate(values):
-            txt = clip(v, WIDTHS[i])
+            txt = clip_local(v, WIDTHS[i])
             a = ALIGNS[i]
             if a == "r":
                 parts.append(txt.rjust(WIDTHS[i]))
@@ -255,23 +281,14 @@ def main() -> None:
                 parts.append(txt.ljust(WIDTHS[i]))
         return "| " + " | ".join(parts) + " |"
 
-
     def print_header_once() -> None:
         headers = [h for _, h, _, _ in COLS]
-        header_parts = []
-        for i, h in enumerate(headers):
-            w = WIDTHS[i]
-            a = ALIGNS[i]
-            if a == "c":
-                header_parts.append(h.center(w))
-            else:
-                header_parts.append(h.ljust(w))
-        print("| " + " | ".join(header_parts) + " |")
+        print(fmt_line(headers))
         print("|-" + "-|-".join("-" * w for w in WIDTHS) + "-|")
         sys.stdout.flush()
 
-    def print_row(person: Dict[str, str]) -> None:
-        values = [person.get(k, "") for k, _, _, _ in COLS]
+    def print_row_by_cols(rowmap: Dict[str, Any]) -> None:
+        values = [rowmap.get(k, "") for k, _, _, _ in COLS]
         print(fmt_line(values))
         sys.stdout.flush()
 
@@ -290,7 +307,7 @@ def main() -> None:
         json_send(sock, {"op": "ping"})
         expect_ok(json_recv_line(f, timeout_sec=timeout, sock=sock))
 
-        stmt_p, _ = prepare(sock, f, SQL_PERSONEN, timeout=timeout)
+        stmt_p, _ = prepare(sock, f, sql_personen, timeout=timeout)
 
         count = 0
         header_printed = False
@@ -302,66 +319,96 @@ def main() -> None:
                 if prow is None:
                     break
 
-                if len(prow) < 8:
-                    log_error(f"Row has {len(prow)} cols, expected 8. raw={jshort(prow)}")
+                if len(prow) < 10:
+                    log_error(f"Row has {len(prow)} cols, expected 10. raw={jshort(prow)}")
                     continue
 
                 count += 1
-                pid, voornaam, achternaam, geboortedatum, woonplaats, opleiding, functie_code, ervaring_sinds = prow
-                functie_code_str = "" if functie_code is None else str(functie_code)
-
-                # Lookups without JOIN
-                f_oms = fetch_single_text(
-                    sock, f,
-                    "SELECT omschrijving FROM functie WHERE code=" + sql_quote(functie_code_str) + " LIMIT 1",
-                    timeout=timeout
-                ) or ""
-
-                cat_code = fetch_single_text(
-                    sock, f,
-                    "SELECT categorie_code FROM functie WHERE code=" + sql_quote(functie_code_str) + " LIMIT 1",
-                    timeout=timeout
-                ) or ""
-
-                cat_oms = ""
-                if cat_code:
-                    cat_oms = fetch_single_text(
-                        sock, f,
-                        "SELECT omschrijving FROM functie_categorie WHERE code=" + sql_quote(cat_code) + " LIMIT 1",
-                        timeout=timeout
-                    ) or ""
+                pid, voornaam, achternaam, geboortedatum, woonplaats, opleiding_code, functie_code, categorie_code, ervaring_sinds, inkomen = prow
 
                 gb_date = parse_ymd(str(geboortedatum))
                 erv_date = parse_ymd(str(ervaring_sinds))
-                opl_code = str(opleiding)
-                opl_oms = fetch_single_text(
-                    sock, f,
-                    "SELECT omschrijving FROM onderwijsniveau WHERE code=" + sql_quote(opl_code) + " LIMIT 1",
-                    timeout=timeout
-                ) or ""
 
-                opleiding_str = f"{opl_code} - {opl_oms}" if opl_oms else opl_code
-                person = {
-                    "voornaam": str(voornaam),
-                    "achternaam": str(achternaam),
-                    "naam": f"{achternaam}, {voornaam}",
-                    "geboorte_fmt": fmt_ddmmyyyy(gb_date),
-                    "leeftijd": years_between(gb_date, today),
-                    "woonplaats": str(woonplaats),
-                    "opleiding": opleiding_str,
-                    "functie": f"{functie_code_str} - {f_oms}",
-                    "categorie": f"{cat_code} - {cat_oms}" if (cat_code or cat_oms) else "",
-                    "ervaring_jaren": years_between(erv_date, today),
-                }
+                naam = f"{achternaam}, {voornaam}"
+                geboorte_fmt = fmt_ddmmyyyy(gb_date)
+                ervaring_sinds_fmt = fmt_ddmmyyyy(erv_date)
+                leeftijd = years_between(gb_date, today)
+                ervaring_jaren = years_between(erv_date, today)
+                inkomen_fmt = fmt_eur(inkomen)
 
-                # Output mode:
-                if LOG_LEVEL >= LOG_DEBUG:
+                # Lookups (needed for debug_cards and for --wide)
+                opl_oms = ""
+                fnc_oms = ""
+                cat_oms = ""
+                if debug_cards or args.wide:
+                    opl_oms = fetch_single_text(
+                        sock, f,
+                        "SELECT omschrijving FROM onderwijsniveau WHERE code=" + sql_quote(str(opleiding_code)) + " LIMIT 1",
+                        timeout=timeout
+                    ) or ""
+                    fnc_oms = fetch_single_text(
+                        sock, f,
+                        "SELECT omschrijving FROM functie WHERE code=" + sql_quote(str(functie_code)) + " LIMIT 1",
+                        timeout=timeout
+                    ) or ""
+                    cat_oms = fetch_single_text(
+                        sock, f,
+                        "SELECT omschrijving FROM functie_categorie WHERE code=" + sql_quote(str(categorie_code)) + " LIMIT 1",
+                        timeout=timeout
+                    ) or ""
+
+                if debug_cards:
+                    # ALWAYS card in debug, regardless of --wide
+                    person = {
+                        "id": str(pid),
+                        "naam": naam,
+                        "voornaam": str(voornaam),
+                        "achternaam": str(achternaam),
+                        "geboorte_fmt": geboorte_fmt,
+                        "leeftijd": leeftijd,
+                        "woonplaats": str(woonplaats),
+                        "opleiding_code": str(opleiding_code),
+                        "opleiding_oms": opl_oms,
+                        "functie_code": str(functie_code),
+                        "functie_oms": fnc_oms,
+                        "categorie_code": str(categorie_code),
+                        "categorie_oms": cat_oms,
+                        "ervaring_sinds_fmt": ervaring_sinds_fmt,
+                        "ervaring_jaren": ervaring_jaren,
+                        "inkomen_fmt": inkomen_fmt,
+                    }
                     print_person_card(person)
                 else:
+                    # table modes
+                    if args.wide:
+                        rowmap = {
+                            "naam": naam,
+                            "geboorte": geboorte_fmt,
+                            "leeftijd": leeftijd,
+                            "woonplaats": str(woonplaats),
+                            "opleiding": opl_oms,
+                            "functie": fnc_oms,
+                            "categorie": cat_oms,
+                            "ervaring": ervaring_jaren,
+                            "inkomen": inkomen_fmt,
+                        }
+                    else:
+                        rowmap = {
+                            "naam": naam,
+                            "geboorte": geboorte_fmt,
+                            "leeftijd": leeftijd,
+                            "woonplaats": str(woonplaats),
+                            "opleiding_code": str(opleiding_code),
+                            "functie_code": str(functie_code),
+                            "categorie_code": str(categorie_code),
+                            "ervaring": ervaring_jaren,
+                            "inkomen": inkomen_fmt,
+                        }
+
                     if not header_printed:
                         print_header_once()
                         header_printed = True
-                    print_row(person)
+                    print_row_by_cols(rowmap)
 
                 if args.limit and count >= args.limit:
                     break
