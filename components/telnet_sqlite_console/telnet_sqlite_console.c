@@ -687,6 +687,9 @@ static void dot_help(void)
     "  .cat <file>           Show file contents\r\n"
     "  .rm <file>            Remove file\r\n"
     "  .mv <src> <dst>       Rename or move file\r\n"
+    "  .pwd                 Print current directory\r\n"
+    "  .cd [dir]            Change directory (default /sdcard)\r\n"
+    "  .df                  Show filesystem usage (not implementd)\r\n"
     "\r\n"
     "Notes:\r\n"
     "  - .read reads up to 256KB per file.\r\n"
@@ -835,6 +838,84 @@ static void dot_mv(const char* args)
     sendf_tel("ERR: cannot rename %s -> %s (errno=%d)\r\n", src, dst, errno);
 }
 
+// ---- current working directory (per "console", single client) ----
+static char s_cwd[256] = "/sdcard";   // start hier, past bij jouw .ls output
+
+static void path_join(char* out, size_t out_sz, const char* base, const char* rel)
+{
+  if (!out || out_sz == 0) return;
+
+  if (!rel || !*rel) {
+    strncpy(out, base ? base : "/", out_sz - 1);
+    out[out_sz - 1] = 0;
+    return;
+  }
+
+  // absolute
+  if (rel[0] == '/') {
+    strncpy(out, rel, out_sz - 1);
+    out[out_sz - 1] = 0;
+    return;
+  }
+
+  // base "/" special
+  if (!base || !*base || strcmp(base, "/") == 0) {
+    snprintf(out, out_sz, "/%s", rel);
+    out[out_sz - 1] = 0;
+    return;
+  }
+
+  // normal
+  snprintf(out, out_sz, "%s/%s", base, rel);
+  out[out_sz - 1] = 0;
+}
+
+static void dot_pwd(void)
+{
+  sendf_tel("%s\r\n", s_cwd);
+}
+
+static void dot_cd( const char* path)
+{
+  if (!path || !*path) {
+    // cd zonder args -> naar /sdcard
+    strncpy(s_cwd, "/sdcard", sizeof(s_cwd) - 1);
+    s_cwd[sizeof(s_cwd) - 1] = 0;
+    sendf_tel("OK\r\n");
+    return;
+  }
+
+  char target[256];
+  path_join(target, sizeof(target), s_cwd, path);
+
+  // Probeer echt te chdir'en (als jouw VFS dit ondersteunt)
+  if (chdir(target) == 0) {
+    // getcwd kan op ESP-IDF soms werken; zo niet, houden we target aan
+    char* got = getcwd(NULL, 0);
+    if (got) {
+      strncpy(s_cwd, got, sizeof(s_cwd) - 1);
+      s_cwd[sizeof(s_cwd) - 1] = 0;
+      free(got);
+    } else {
+      strncpy(s_cwd, target, sizeof(s_cwd) - 1);
+      s_cwd[sizeof(s_cwd) - 1] = 0;
+    }
+    sendf_tel("OK\r\n");
+    return;
+  }
+
+  // Als chdir niet werkt (of niet supported), dan checken we of het een dir is
+  struct stat st;
+  if (stat(target, &st) == 0 && S_ISDIR(st.st_mode)) {
+    strncpy(s_cwd, target, sizeof(s_cwd) - 1);
+    s_cwd[sizeof(s_cwd) - 1] = 0;
+    sendf_tel("OK (no chdir)\r\n");
+    return;
+  }
+
+  sendf_tel("ERR: cannot cd to '%s' (errno=%d)\r\n", target, errno);
+}
+
 static bool handle_dot_command(char* line)
 {
   trim(line);
@@ -940,7 +1021,9 @@ static bool handle_dot_command(char* line)
   if (!strcmp(tok, ".cat")) { dot_cat((rest && *rest) ? rest : NULL); return true; }
   if (!strcmp(tok, ".rm"))  { dot_rm((rest && *rest) ? rest : NULL); return true; }
   if (!strcmp(tok, ".mv"))  { dot_mv((rest && *rest) ? rest : NULL); return true; }
-
+  if (!strcmp(tok, ".pwd")) { dot_pwd(); return true; }
+  if (!strcmp(tok, ".cd"))  { dot_cd((rest && *rest) ? rest : NULL); return true; }
+  //-?-if (!strcmp(tok, ".df"))  { dot_df(); return true; }
   send_str_tel("Unknown dot-command. Try .help\r\n");
   return true;
 }
@@ -951,6 +1034,11 @@ static void process_rx_data_bytes(const uint8_t* data, size_t len)
   for (size_t i = 0; i < len; i++)
   {
     unsigned char ch = data[i];
+    
+    // Telnet Enter komt vaak als CRLF of CRNUL
+    if (ch == '\n' || ch == 0) {
+      continue;                 // negeer LF en NUL
+    }
 
     if (ch == '\r' || ch == '\n')
     {
