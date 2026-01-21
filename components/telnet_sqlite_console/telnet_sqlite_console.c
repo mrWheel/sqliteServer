@@ -7,12 +7,34 @@
 #include <errno.h>
 #include <stdarg.h>
 
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+
+// We gebruiken libtelnet uit de esp_telnet component.
+// Pad klopt als je esp_telnet/src als include dir toevoegt.
+#include "libtelnet.h"
+
+// ---- telnet option numbers (als jouw libtelnet.h ze niet definieert) ----
+#ifndef TELOPT_ECHO
+  #define TELOPT_ECHO 1
+#endif
+#ifndef TELOPT_SGA
+  #define TELOPT_SGA 3
+#endif
+#ifndef TELOPT_TTYPE
+  #define TELOPT_TTYPE 24
+#endif
+#ifndef TELOPT_NAWS
+  #define TELOPT_NAWS 31
+#endif
 
 static const char* TAG = "TELNETSQL";
 
@@ -23,45 +45,128 @@ static int s_listen_fd = -1;
 static int s_client_fd = -1;
 
 /* ---------- Console options (sqlite-ish) ---------- */
-typedef enum
-{
+typedef enum {
   MODE_LIST = 0,
-  MODE_CSV = 1,
+  MODE_CSV  = 1,
   MODE_TABS = 2,
 } out_mode_t;
 
-static struct
-{
+static struct {
   bool headers;
   bool echo;
   out_mode_t mode;
-  char sep[8];        // separator for list/csv
-  char nullvalue[16]; // replacement for NULL
+  char sep[8];
+  char nullvalue[16];
 } s_opt = {
-    .headers = true,
-    .echo = true,
-    .mode = MODE_LIST,
-    .sep = "|",
-    .nullvalue = "NULL",
+  .headers   = true,
+  .echo      = true,
+  .mode      = MODE_LIST,
+  .sep       = "|",
+  .nullvalue = "NULL",
 };
 
-static void send_str(int fd, const char* s)
+/* ---------- telnet session state (1 client) ---------- */
+typedef struct {
+  telnet_t* telnet;
+  char line[512];
+  int  llen;
+} session_t;
+
+static session_t s_sess = {0};
+
+/* ---------- forward decls ---------- */
+static void close_client_locked(void);
+
+static void send_str_tel(const char* s);
+static void sendf_tel(const char* fmt, ...);
+static void prompt_tel(void);
+
+static void trim(char* s);
+static void split_first_token(char* line, char** tok, char** rest);
+
+static void exec_sql_text(const char* sql_in);
+
+static void dot_read(const char* path);
+static void dot_import(char* args);
+
+static void dot_help(void);
+static void dot_tables(void);
+static void dot_schema(const char* table);
+static void dot_dbinfo(void);
+
+// fs dot commands
+static void dot_ls(const char* path);
+static void dot_cat(const char* path);
+static void dot_rm(const char* path);
+static void dot_mv(const char* args);
+
+static bool handle_dot_command(char* line);
+
+/* ---------- telnet send plumbing ---------- */
+// libtelnet vraagt ons om bytes te versturen via TELNET_EV_SEND.
+// Dus send_str_tel() schrijft naar telnet_send(), en telnet_event handler doet send().
+
+static void telnet_event_handler(telnet_t* telnet, telnet_event_t* ev, void* user_data)
 {
-  if (!s)
-    return;
-  send(fd, s, strlen(s), 0);
+  (void)telnet;
+  (void)user_data;
+
+  switch (ev->type)
+  {
+    case TELNET_EV_SEND:
+      if (s_client_fd >= 0 && ev->data.buffer && ev->data.size > 0)
+      {
+        // best-effort; bij errors sluiten we de client later in recv loop
+        (void)send(s_client_fd, ev->data.buffer, ev->data.size, 0);
+      }
+      break;
+
+    case TELNET_EV_ERROR:
+      ESP_LOGW(TAG, "telnet error: %s", ev->error.msg ? ev->error.msg : "(null)");
+      break;
+
+    default:
+      // DATA verwerken we via telnet_recv() -> TELNET_EV_DATA events (zie hieronder)
+      break;
+  }
 }
 
-static void sendf(int fd, const char* fmt, ...)
+static const telnet_telopt_t s_telopts[] = {
+  // server WILL ECHO + SGA
+  { TELOPT_ECHO, TELNET_WILL, TELNET_DONT },
+  { TELOPT_SGA,  TELNET_WILL, TELNET_DONT },
+
+  // we ask client for NAWS + TTYPE (client WILL)
+  { TELOPT_NAWS,  TELNET_DO,   TELNET_DONT },
+  { TELOPT_TTYPE, TELNET_DO,   TELNET_DONT },
+
+  // netjes afsluiten
+  { -1, 0, 0 }
+};
+
+static void send_str_tel(const char* s)
 {
+  if (!s || !s_sess.telnet) return;
+  telnet_send(s_sess.telnet, s, (unsigned)strlen(s));
+}
+
+static void sendf_tel(const char* fmt, ...)
+{
+  if (!fmt) return;
   char buf[512];
   va_list ap;
   va_start(ap, fmt);
   vsnprintf(buf, sizeof(buf), fmt, ap);
   va_end(ap);
-  send_str(fd, buf);
+  send_str_tel(buf);
 }
 
+static void prompt_tel(void)
+{
+  send_str_tel("sqlite> ");
+}
+
+/* ---------- connection mgmt ---------- */
 static void close_client_locked(void)
 {
   if (s_client_fd >= 0)
@@ -70,270 +175,23 @@ static void close_client_locked(void)
     close(s_client_fd);
     s_client_fd = -1;
   }
-}
 
-// Telnet constants
-#define IAC 255
-#define DONT 254
-#define DO 253
-#define WONT 252
-#define WILL 251
-#define SB 250
-#define SE 240
-
-// Telnet options
-#define TELOPT_ECHO 1
-#define TELOPT_SGA 3
-#define TELOPT_TTYPE 24
-#define TELOPT_NAWS 31
-#define TELOPT_LINEMODE 34
-#define TELOPT_AUTH 37
-#define TELOPT_ENCRYPT 38
-
-static void telnet_send_cmd(int fd, unsigned char cmd, unsigned char opt)
-{
-  unsigned char b[3] = {IAC, cmd, opt};
-  (void)send(fd, b, sizeof(b), 0);
-}
-
-/****
-static bool server_wants_to_will(unsigned char opt) {
-    // options we are willing to perform as server
-    return (opt == TELOPT_ECHO || opt == TELOPT_SGA);
-}
-****/
-
-static bool server_wants_client_to_will(unsigned char opt)
-{
-  // options we want client to perform
-  return (opt == TELOPT_NAWS || opt == TELOPT_TTYPE);
-}
-
-static void telnet_reply_nego(int fd, unsigned char cmd, unsigned char opt)
-{
-  // Hard refuse AUTH/ENCRYPT always
-  if (opt == TELOPT_AUTH || opt == TELOPT_ENCRYPT)
+  if (s_sess.telnet)
   {
-    // ESP_LOGI(TAG, "telnet: refuse opt=%u cmd=%u", opt, cmd);
-    if (cmd == DO)
-    {
-      telnet_send_cmd(fd, WONT, opt);
-      return;
-    }
-    if (cmd == WILL)
-    {
-      telnet_send_cmd(fd, DONT, opt);
-      return;
-    }
-    if (cmd == DONT)
-    {
-      telnet_send_cmd(fd, WONT, opt);
-      return;
-    }
-    if (cmd == WONT)
-    {
-      telnet_send_cmd(fd, DONT, opt);
-      return;
-    }
+    telnet_free(s_sess.telnet);
+    s_sess.telnet = NULL;
   }
 
-  // Client says server WILL do something: WILL opt
-  // If we want client to do it: DO opt else DONT opt
-  if (cmd == WILL)
-  {
-    telnet_send_cmd(fd, server_wants_client_to_will(opt) ? DO : DONT, opt);
-    return;
-  }
-
-  // Polite acknowledgements
-  if (cmd == DONT)
-  {
-    telnet_send_cmd(fd, WONT, opt);
-    return;
-  }
-  if (cmd == WONT)
-  {
-    telnet_send_cmd(fd, DONT, opt);
-    return;
-  }
-}
-
-// A more “real telnet server” init for macOS telnet
-static void telnet_init(int fd)
-{
-  // Refuse auth/encrypt up front (macOS telnet otherwise bails)
-  telnet_send_cmd(fd, DONT, TELOPT_AUTH);
-  telnet_send_cmd(fd, DONT, TELOPT_ENCRYPT);
-
-  // We will echo and suppress go-ahead
-  telnet_send_cmd(fd, WILL, TELOPT_ECHO);
-  telnet_send_cmd(fd, WILL, TELOPT_SGA);
-
-  // We want client to send NAWS and TTYPE
-  telnet_send_cmd(fd, DO, TELOPT_NAWS);
-  telnet_send_cmd(fd, DO, TELOPT_TTYPE);
-
-  // We don't do linemode
-  telnet_send_cmd(fd, DONT, TELOPT_LINEMODE);
-}
-
-static void telnet_drain_negotiation(int fd)
-{
-  // korte receive timeout zodat we niet blokkeren
-  struct timeval tv;
-  tv.tv_sec = 0;
-  tv.tv_usec = 200 * 1000; // 200ms
-  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-  unsigned char b[256];
-
-  for (int tries = 0; tries < 5; tries++)
-  { // max ~1s totaal
-    int r = recv(fd, b, sizeof(b), 0);
-    if (r <= 0)
-      break;
-
-    // Alleen telnet commands verwerken; user-data weggooien (komt pas na de handshake)
-    for (int i = 0; i < r; i++)
-    {
-      if (b[i] != IAC)
-        continue;
-      if (i + 1 >= r)
-        break;
-      unsigned char cmd = b[i + 1];
-
-      if (cmd == SB)
-      {
-        // skip subnegotiation until IAC SE
-        i += 2;
-        while (i < r)
-        {
-          if (b[i] == IAC && (i + 1) < r && b[i + 1] == SE)
-          {
-            i += 1;
-            break;
-          }
-          i++;
-        }
-        continue;
-      }
-
-      if (cmd == DO || cmd == DONT || cmd == WILL || cmd == WONT)
-      {
-        if (i + 2 >= r)
-          break;
-        unsigned char opt = b[i + 2];
-        telnet_reply_nego(fd, cmd, opt);
-        i += 2;
-        continue;
-      }
-
-      // other 2-byte IAC commands
-      i += 1;
-    }
-  }
-
-  // timeout weer uit (optioneel)
-  tv.tv_sec = 0;
-  tv.tv_usec = 0;
-  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-}
-
-/* telnet-aware IAC filter + negotiation replies (macOS telnet friendly) */
-static int recv_filtered(int fd, unsigned char* out, int outlen)
-{
-  unsigned char b[256];
-  int r = recv(fd, b, sizeof(b), 0);
-  if (r <= 0)
-    return r;
-
-  // debug (optioneel): alleen loggen als er minimaal 4 bytes zijn
-  /*** 
-  if (r >= 4)
-  {
-    ESP_LOGI(TAG, "rx %d bytes, first=%02X %02X %02X %02X",
-             r, b[0], b[1], b[2], b[3]);
-  }
-  else
-  {
-    ESP_LOGI(TAG, "rx %d bytes, first=%02X", r, b[0]);
-  }
-  ***/
-  int w = 0;
-
-  for (int i = 0; i < r && w < outlen; i++)
-  {
-    unsigned char ch = b[i];
-
-    if (ch != IAC)
-    {
-      out[w++] = ch;
-      continue;
-    }
-
-    if (i + 1 >= r)
-      break;
-    unsigned char cmd = b[i + 1];
-
-    // IAC IAC => literal 0xFF
-    if (cmd == IAC)
-    {
-      out[w++] = IAC;
-      i += 1;
-      continue;
-    }
-
-    // IAC SB ... IAC SE
-    if (cmd == SB)
-    {
-      i += 2;
-      while (i < r)
-      {
-        if (b[i] == IAC && (i + 1) < r && b[i + 1] == SE)
-        {
-          i += 1; // consume SE
-          break;
-        }
-        i++;
-      }
-      continue;
-    }
-
-    // IAC DO/DONT/WILL/WONT <opt>
-    if (cmd == DO || cmd == DONT || cmd == WILL || cmd == WONT)
-    {
-      if (i + 2 >= r)
-        break;
-      unsigned char opt = b[i + 2];
-
-      telnet_reply_nego(fd, cmd, opt);
-
-      i += 2; // skip cmd+opt
-      continue;
-    }
-
-    // Other 2-byte IAC commands
-    i += 1;
-  }
-
-  return w;
-}
-
-static void prompt(int fd)
-{
-  send_str(fd, "sqlite> ");
+  memset(&s_sess, 0, sizeof(s_sess));
 }
 
 /* ---------- helpers ---------- */
 static void trim(char* s)
 {
-  if (!s)
-    return;
+  if (!s) return;
   char* p = s;
-  while (*p && isspace((unsigned char)*p))
-    p++;
-  if (p != s)
-    memmove(s, p, strlen(p) + 1);
+  while (*p && isspace((unsigned char)*p)) p++;
+  if (p != s) memmove(s, p, strlen(p) + 1);
 
   size_t n = strlen(s);
   while (n > 0 && isspace((unsigned char)s[n - 1]))
@@ -346,59 +204,50 @@ static void trim(char* s)
 static void split_first_token(char* line, char** tok, char** rest)
 {
   *tok = line;
-  while (**tok && isspace((unsigned char)**tok))
-    (*tok)++;
+  while (**tok && isspace((unsigned char)**tok)) (*tok)++;
   char* p = *tok;
-  while (*p && !isspace((unsigned char)*p))
-    p++;
-  if (*p)
-  {
-    *p = 0;
-    p++;
-  }
-  while (*p && isspace((unsigned char)*p))
-    p++;
+  while (*p && !isspace((unsigned char)*p)) p++;
+  if (*p) { *p = 0; p++; }
+  while (*p && isspace((unsigned char)*p)) p++;
   *rest = p;
 }
 
-static void print_value(int fd, int t, sqlite3_stmt* stmt, int col)
+/* ---------- sqlite printing ---------- */
+static void print_value(int t, sqlite3_stmt* stmt, int col)
 {
   if (t == SQLITE_NULL)
   {
-    send_str(fd, s_opt.nullvalue);
+    send_str_tel(s_opt.nullvalue);
   }
   else if (t == SQLITE_INTEGER)
   {
     char buf[32];
     snprintf(buf, sizeof(buf), "%lld", (long long)sqlite3_column_int64(stmt, col));
-    send_str(fd, buf);
+    send_str_tel(buf);
   }
   else if (t == SQLITE_FLOAT)
   {
     char buf[64];
     snprintf(buf, sizeof(buf), "%.17g", sqlite3_column_double(stmt, col));
-    send_str(fd, buf);
+    send_str_tel(buf);
   }
   else
   {
     const unsigned char* txt = sqlite3_column_text(stmt, col);
-    send_str(fd, txt ? (const char*)txt : "");
+    send_str_tel(txt ? (const char*)txt : "");
   }
 }
 
-static void print_row_sep(int fd)
+static void print_row_sep(void)
 {
-  if (s_opt.mode == MODE_TABS)
-    send_str(fd, "\t");
-  else
-    send_str(fd, s_opt.sep);
+  if (s_opt.mode == MODE_TABS) send_str_tel("\t");
+  else                        send_str_tel(s_opt.sep);
 }
 
 /* ---------- SQL execution (multi-statement) ---------- */
-static void exec_sql_text(int fd, const char* sql_in)
+static void exec_sql_text(const char* sql_in)
 {
-  if (!sql_in || !*sql_in)
-    return;
+  if (!sql_in || !*sql_in) return;
 
   xSemaphoreTake(s_db_mutex, portMAX_DELAY);
 
@@ -410,13 +259,11 @@ static void exec_sql_text(int fd, const char* sql_in)
     int rc = sqlite3_prepare_v2(s_db, sql, -1, &stmt, &sql);
     if (rc != SQLITE_OK)
     {
-      sendf(fd, "ERR: %s\r\n", sqlite3_errmsg(s_db));
-      if (stmt)
-        sqlite3_finalize(stmt);
+      sendf_tel("ERR: %s\r\n", sqlite3_errmsg(s_db));
+      if (stmt) sqlite3_finalize(stmt);
       break;
     }
-    if (!stmt)
-      break; // done
+    if (!stmt) break; // klaar
 
     int cols = sqlite3_column_count(stmt);
     if (cols > 0)
@@ -425,11 +272,10 @@ static void exec_sql_text(int fd, const char* sql_in)
       {
         for (int c = 0; c < cols; c++)
         {
-          if (c)
-            print_row_sep(fd);
-          send_str(fd, sqlite3_column_name(stmt, c));
+          if (c) print_row_sep();
+          send_str_tel(sqlite3_column_name(stmt, c));
         }
-        send_str(fd, "\r\n");
+        send_str_tel("\r\n");
       }
 
       int s;
@@ -437,16 +283,15 @@ static void exec_sql_text(int fd, const char* sql_in)
       {
         for (int c = 0; c < cols; c++)
         {
-          if (c)
-            print_row_sep(fd);
+          if (c) print_row_sep();
           int t = sqlite3_column_type(stmt, c);
-          print_value(fd, t, stmt, c);
+          print_value(t, stmt, c);
         }
-        send_str(fd, "\r\n");
+        send_str_tel("\r\n");
       }
       if (s != SQLITE_DONE)
       {
-        sendf(fd, "ERR: %s\r\n", sqlite3_errmsg(s_db));
+        sendf_tel("ERR: %s\r\n", sqlite3_errmsg(s_db));
         sqlite3_finalize(stmt);
         break;
       }
@@ -456,13 +301,13 @@ static void exec_sql_text(int fd, const char* sql_in)
       int s = sqlite3_step(stmt);
       if (s != SQLITE_DONE)
       {
-        sendf(fd, "ERR: %s\r\n", sqlite3_errmsg(s_db));
+        sendf_tel("ERR: %s\r\n", sqlite3_errmsg(s_db));
         sqlite3_finalize(stmt);
         break;
       }
-      sendf(fd, "OK (changes=%d last_id=%lld)\r\n",
-            sqlite3_changes(s_db),
-            (long long)sqlite3_last_insert_rowid(s_db));
+      sendf_tel("OK (changes=%d last_id=%lld)\r\n",
+                sqlite3_changes(s_db),
+                (long long)sqlite3_last_insert_rowid(s_db));
     }
 
     sqlite3_finalize(stmt);
@@ -472,41 +317,41 @@ static void exec_sql_text(int fd, const char* sql_in)
   xSemaphoreGive(s_db_mutex);
 }
 
-/* ---------- .read implementation ---------- */
+/* ---------- .read ---------- */
 #define READ_MAX_BYTES (256 * 1024)
 
-static void dot_read(int fd, const char* path)
+static void dot_read(const char* path)
 {
   if (!path || !*path)
   {
-    send_str(fd, "Usage: .read /spiffs/init.sql\r\n");
+    send_str_tel("Usage: .read /spiffs/init.sql\r\n");
     return;
   }
 
   FILE* f = fopen(path, "rb");
   if (!f)
   {
-    sendf(fd, "ERR: cannot open %s\r\n", path);
+    sendf_tel("ERR: cannot open %s\r\n", path);
     return;
   }
 
   if (fseek(f, 0, SEEK_END) != 0)
   {
     fclose(f);
-    send_str(fd, "ERR: fseek failed\r\n");
+    send_str_tel("ERR: fseek failed\r\n");
     return;
   }
   long sz = ftell(f);
   if (sz < 0)
   {
     fclose(f);
-    send_str(fd, "ERR: ftell failed\r\n");
+    send_str_tel("ERR: ftell failed\r\n");
     return;
   }
   if (sz > READ_MAX_BYTES)
   {
     fclose(f);
-    sendf(fd, "ERR: file too large (%ld bytes, max %d)\r\n", sz, (int)READ_MAX_BYTES);
+    sendf_tel("ERR: file too large (%ld bytes, max %d)\r\n", sz, (int)READ_MAX_BYTES);
     return;
   }
   rewind(f);
@@ -515,7 +360,7 @@ static void dot_read(int fd, const char* path)
   if (!buf)
   {
     fclose(f);
-    send_str(fd, "ERR: OOM\r\n");
+    send_str_tel("ERR: OOM\r\n");
     return;
   }
 
@@ -524,32 +369,23 @@ static void dot_read(int fd, const char* path)
 
   buf[n] = 0;
 
-  sendf(fd, "-- .read %s (%u bytes)\r\n", path, (unsigned)n);
-  exec_sql_text(fd, buf);
+  sendf_tel("-- .read %s (%u bytes)\r\n", path, (unsigned)n);
+  exec_sql_text(buf);
   free(buf);
 }
 
-/* ---------- .import implementation ---------- */
-
-static void sqlite_exec_simple(int fd, const char* sql)
+/* ---------- .import (zelfde als jouw oude, maar output via telnet) ---------- */
+static void sqlite_exec_simple(const char* sql)
 {
   char* err = NULL;
   int rc = sqlite3_exec(s_db, sql, NULL, NULL, &err);
   if (rc != SQLITE_OK)
   {
-    sendf(fd, "ERR: %s\r\n", err ? err : sqlite3_errmsg(s_db));
-    if (err)
-      sqlite3_free(err);
+    sendf_tel("ERR: %s\r\n", err ? err : sqlite3_errmsg(s_db));
+    if (err) sqlite3_free(err);
   }
 }
 
-/* Basic CSV parser:
-   - comma separated
-   - quoted fields with "..."
-   - escaped quote inside quotes: ""
-   Returns number of fields parsed into out[] (pointers into buf).
-   Modifies buf in-place by inserting NULs.
-*/
 static int parse_csv_inplace(char* buf, char** out, int max_fields)
 {
   int n = 0;
@@ -557,28 +393,22 @@ static int parse_csv_inplace(char* buf, char** out, int max_fields)
 
   while (*p && n < max_fields)
   {
-    // skip leading spaces (optional)
-    // while (*p == ' ') p++;
-
     char* start = p;
     if (*p == '"')
     {
-      // quoted
-      p++; // skip first quote
+      p++;
       start = p;
       char* w = p;
       while (*p)
       {
         if (*p == '"' && p[1] == '"')
         {
-          // escaped quote -> write one quote
           *w++ = '"';
           p += 2;
           continue;
         }
         if (*p == '"')
         {
-          // end quote
           p++;
           break;
         }
@@ -586,38 +416,23 @@ static int parse_csv_inplace(char* buf, char** out, int max_fields)
       }
       *w = 0;
 
-      // consume until comma or end
-      while (*p && *p != ',')
-        p++;
-      if (*p == ',')
-      {
-        *p = 0;
-        p++;
-      }
+      while (*p && *p != ',') p++;
+      if (*p == ',') { *p = 0; p++; }
       out[n++] = start;
     }
     else
     {
-      // unquoted until comma
-      while (*p && *p != ',')
-        p++;
-      if (*p == ',')
-      {
-        *p = 0;
-        p++;
-      }
-      // trim trailing spaces
+      while (*p && *p != ',') p++;
+      if (*p == ',') { *p = 0; p++; }
+
       char* e = start + strlen(start);
-      while (e > start && (e[-1] == '\r' || e[-1] == '\n'))
-        e--;
-      while (e > start && isspace((unsigned char)e[-1]))
-        e--;
+      while (e > start && (e[-1] == '\r' || e[-1] == '\n')) e--;
+      while (e > start && isspace((unsigned char)e[-1])) e--;
       *e = 0;
       out[n++] = start;
     }
   }
 
-  // trim CRLF on last field if not handled
   if (n > 0)
   {
     char* s = out[n - 1];
@@ -636,7 +451,6 @@ static int split_sep_inplace(char* buf, char** out, int max_fields, char sep)
   int n = 0;
   char* p = buf;
 
-  // strip CRLF
   size_t L = strlen(p);
   while (L > 0 && (p[L - 1] == '\r' || p[L - 1] == '\n'))
   {
@@ -648,8 +462,7 @@ static int split_sep_inplace(char* buf, char** out, int max_fields, char sep)
   {
     out[n++] = p;
     char* q = strchr(p, sep);
-    if (!q)
-      break;
+    if (!q) break;
     *q = 0;
     p = q + 1;
   }
@@ -658,10 +471,7 @@ static int split_sep_inplace(char* buf, char** out, int max_fields, char sep)
 
 static bool is_valid_identifier_like(const char* s)
 {
-  // minimal check to reduce injection risk in table name
-  // allows letters, digits, underscore, and dot
-  if (!s || !*s)
-    return false;
+  if (!s || !*s) return false;
   for (const char* p = s; *p; p++)
   {
     if (!(isalnum((unsigned char)*p) || *p == '_' || *p == '.'))
@@ -670,159 +480,111 @@ static bool is_valid_identifier_like(const char* s)
   return true;
 }
 
-static void dot_import(int fd, char* args)
+static void dot_import(char* args)
 {
-  // Syntax:
-  // .import [--csv] [--tabs] [--separator X] [--skip N] <file> <table>
   bool csv = false;
   char sep = (s_opt.mode == MODE_TABS) ? '\t' : s_opt.sep[0];
   int skip = 0;
 
-  // tokenise args (space separated)
   char* tokv[16];
   int tokc = 0;
   char* p = args;
   while (p && *p)
   {
-    while (*p && isspace((unsigned char)*p))
-      p++;
-    if (!*p)
-      break;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (!*p) break;
     tokv[tokc++] = p;
-    if (tokc >= (int)(sizeof(tokv) / sizeof(tokv[0])))
-      break;
-    while (*p && !isspace((unsigned char)*p))
-      p++;
-    if (*p)
-      *p++ = 0;
+    if (tokc >= (int)(sizeof(tokv) / sizeof(tokv[0]))) break;
+    while (*p && !isspace((unsigned char)*p)) p++;
+    if (*p) *p++ = 0;
   }
 
-  // parse options
   int i = 0;
   for (; i < tokc; i++)
   {
-    if (strcmp(tokv[i], "--csv") == 0)
-    {
-      csv = true;
-      continue;
-    }
-    if (strcmp(tokv[i], "--tabs") == 0)
-    {
-      csv = false;
-      sep = '\t';
-      continue;
-    }
+    if (strcmp(tokv[i], "--csv") == 0) { csv = true; continue; }
+    if (strcmp(tokv[i], "--tabs") == 0) { csv = false; sep = '\t'; continue; }
     if (strcmp(tokv[i], "--separator") == 0)
     {
-      if (i + 1 >= tokc)
-      {
-        send_str(fd, "Usage: .import --separator X <file> <table>\r\n");
-        return;
-      }
+      if (i + 1 >= tokc) { send_str_tel("Usage: .import --separator X <file> <table>\r\n"); return; }
       sep = tokv[++i][0];
       csv = false;
       continue;
     }
     if (strcmp(tokv[i], "--skip") == 0)
     {
-      if (i + 1 >= tokc)
-      {
-        send_str(fd, "Usage: .import --skip N <file> <table>\r\n");
-        return;
-      }
+      if (i + 1 >= tokc) { send_str_tel("Usage: .import --skip N <file> <table>\r\n"); return; }
       skip = atoi(tokv[++i]);
-      if (skip < 0)
-        skip = 0;
+      if (skip < 0) skip = 0;
       continue;
     }
-    // first non-option token => file
     break;
   }
 
   if (tokc - i < 2)
   {
-    send_str(fd, "Usage: .import [--csv] [--skip N] [--separator X] <file> <table>\r\n");
+    send_str_tel("Usage: .import [--csv] [--tabs] [--separator X] [--skip N] <file> <table>\r\n");
     return;
   }
 
-  const char* file = tokv[i];
+  const char* file  = tokv[i];
   const char* table = tokv[i + 1];
 
   if (!is_valid_identifier_like(table))
   {
-    send_str(fd, "ERR: invalid table name (allowed: a-z A-Z 0-9 _ .)\r\n");
+    send_str_tel("ERR: invalid table name (allowed: a-z A-Z 0-9 _ .)\r\n");
     return;
   }
 
   FILE* f = fopen(file, "rb");
-  if (!f)
-  {
-    sendf(fd, "ERR: cannot open %s\r\n", file);
-    return;
-  }
+  if (!f) { sendf_tel("ERR: cannot open %s\r\n", file); return; }
 
-  // skip N lines
   char linebuf[1024];
   for (int s = 0; s < skip; s++)
   {
-    if (!fgets(linebuf, sizeof(linebuf), f))
-      break;
+    if (!fgets(linebuf, sizeof(linebuf), f)) break;
   }
 
-  // read first data line to determine column count
   if (!fgets(linebuf, sizeof(linebuf), f))
   {
     fclose(f);
-    send_str(fd, "ERR: empty file (after skip)\r\n");
+    send_str_tel("ERR: empty file (after skip)\r\n");
     return;
   }
 
-  // Make a working copy we can modify
   char work[1024];
   strncpy(work, linebuf, sizeof(work) - 1);
   work[sizeof(work) - 1] = 0;
 
   char* fields[64];
-  int nfields = 0;
-  if (csv)
-  {
-    nfields = parse_csv_inplace(work, fields, 64);
-  }
-  else
-  {
-    nfields = split_sep_inplace(work, fields, 64, sep);
-  }
-
+  int nfields = csv ? parse_csv_inplace(work, fields, 64) : split_sep_inplace(work, fields, 64, sep);
   if (nfields <= 0)
   {
     fclose(f);
-    send_str(fd, "ERR: could not parse first row\r\n");
+    send_str_tel("ERR: could not parse first row\r\n");
     return;
   }
 
-  // prepare INSERT statement
   char sql[256];
-  // "INSERT INTO table VALUES(?,?,?)"
   strcpy(sql, "INSERT INTO ");
   strncat(sql, table, sizeof(sql) - strlen(sql) - 1);
   strncat(sql, " VALUES(", sizeof(sql) - strlen(sql) - 1);
   for (int c = 0; c < nfields; c++)
   {
     strncat(sql, "?", sizeof(sql) - strlen(sql) - 1);
-    if (c != nfields - 1)
-      strncat(sql, ",", sizeof(sql) - strlen(sql) - 1);
+    if (c != nfields - 1) strncat(sql, ",", sizeof(sql) - strlen(sql) - 1);
   }
   strncat(sql, ");", sizeof(sql) - strlen(sql) - 1);
 
   xSemaphoreTake(s_db_mutex, portMAX_DELAY);
 
-  sqlite_exec_simple(fd, "BEGIN;");
+  sqlite_exec_simple("BEGIN;");
   sqlite3_stmt* stmt = NULL;
   int prc = sqlite3_prepare_v2(s_db, sql, -1, &stmt, NULL);
   if (prc != SQLITE_OK || !stmt)
   {
-    sendf(fd, "ERR: prepare failed: %s\r\n", sqlite3_errmsg(s_db));
-    sqlite_exec_simple(fd, "ROLLBACK;");
+    sendf_tel("ERR: prepare failed: %s\r\n", sqlite3_errmsg(s_db));
+    sqlite_exec_simple("ROLLBACK;");
     xSemaphoreGive(s_db_mutex);
     fclose(f);
     return;
@@ -831,7 +593,7 @@ static void dot_import(int fd, char* args)
   long rows = 0;
   bool had_error = false;
 
-  // Import first data row already read (linebuf)
+  // first row (already read)
   {
     char w2[1024];
     strncpy(w2, linebuf, sizeof(w2) - 1);
@@ -839,35 +601,23 @@ static void dot_import(int fd, char* args)
 
     char* f2[64];
     int nf2 = csv ? parse_csv_inplace(w2, f2, 64) : split_sep_inplace(w2, f2, 64, sep);
-    if (nf2 != nfields)
-    {
-      sendf(fd, "WARN: column count mismatch (got %d expected %d), skipping row\r\n", nf2, nfields);
-    }
-    else
+    if (nf2 == nfields)
     {
       sqlite3_reset(stmt);
       sqlite3_clear_bindings(stmt);
-
       for (int c = 0; c < nfields; c++)
-      {
-        const char* val = f2[c];
-        sqlite3_bind_text(stmt, c + 1, val ? val : "", -1, SQLITE_TRANSIENT);
-      }
+        sqlite3_bind_text(stmt, c + 1, f2[c] ? f2[c] : "", -1, SQLITE_TRANSIENT);
 
       int s = sqlite3_step(stmt);
-      if (s != SQLITE_DONE)
-      {
-        sendf(fd, "ERR: step failed: %s\r\n", sqlite3_errmsg(s_db));
-        had_error = true;
-      }
-      else
-      {
-        rows++;
-      }
+      if (s != SQLITE_DONE) { sendf_tel("ERR: step failed: %s\r\n", sqlite3_errmsg(s_db)); had_error = true; }
+      else rows++;
+    }
+    else
+    {
+      sendf_tel("WARN: column count mismatch (got %d expected %d), skipping row\r\n", nf2, nfields);
     }
   }
 
-  // Rest of file
   while (!had_error && fgets(linebuf, sizeof(linebuf), f))
   {
     char w2[1024];
@@ -878,23 +628,19 @@ static void dot_import(int fd, char* args)
     int nf2 = csv ? parse_csv_inplace(w2, f2, 64) : split_sep_inplace(w2, f2, 64, sep);
     if (nf2 != nfields)
     {
-      sendf(fd, "WARN: column count mismatch (got %d expected %d), skipping row\r\n", nf2, nfields);
+      sendf_tel("WARN: column count mismatch (got %d expected %d), skipping row\r\n", nf2, nfields);
       continue;
     }
 
     sqlite3_reset(stmt);
     sqlite3_clear_bindings(stmt);
-
     for (int c = 0; c < nfields; c++)
-    {
-      const char* val = f2[c];
-      sqlite3_bind_text(stmt, c + 1, val ? val : "", -1, SQLITE_TRANSIENT);
-    }
+      sqlite3_bind_text(stmt, c + 1, f2[c] ? f2[c] : "", -1, SQLITE_TRANSIENT);
 
     int s = sqlite3_step(stmt);
     if (s != SQLITE_DONE)
     {
-      sendf(fd, "ERR: step failed: %s\r\n", sqlite3_errmsg(s_db));
+      sendf_tel("ERR: step failed: %s\r\n", sqlite3_errmsg(s_db));
       had_error = true;
     }
     else
@@ -902,130 +648,218 @@ static void dot_import(int fd, char* args)
       rows++;
     }
 
-    if ((rows % 500) == 0)
-      vTaskDelay(pdMS_TO_TICKS(1));
+    if ((rows % 500) == 0) vTaskDelay(pdMS_TO_TICKS(1));
   }
 
   sqlite3_finalize(stmt);
 
-  if (!had_error)
-    sqlite_exec_simple(fd, "COMMIT;");
-  else
-    sqlite_exec_simple(fd, "ROLLBACK;");
+  if (!had_error) sqlite_exec_simple("COMMIT;");
+  else            sqlite_exec_simple("ROLLBACK;");
 
   xSemaphoreGive(s_db_mutex);
-
   fclose(f);
 
-  if (!had_error)
-  {
-    sendf(fd, "Imported %ld rows into %s\r\n", rows, table);
-  }
-  else
-  {
-    send_str(fd, "Import failed (rolled back)\r\n");
-  }
+  if (!had_error) sendf_tel("Imported %ld rows into %s\r\n", rows, table);
+  else            send_str_tel("Import failed (rolled back)\r\n");
 }
 
 /* ---------- dot commands ---------- */
-static void dot_help(int fd)
+static void dot_help(void)
 {
-  send_str(fd,
-           "Dot commands:\r\n"
-           "  .help\r\n"
-           "  .quit | .exit\r\n"
-           "  .tables\r\n"
-           "  .schema [table]\r\n"
-           "  .headers on|off\r\n"
-           "  .mode list|csv|tabs\r\n"
-           "  .separator <sep>\r\n"
-           "  .nullvalue <text>\r\n"
-           "  .timeout <ms>\r\n"
-           "  .echo on|off\r\n"
-           "  .dbinfo\r\n"
-           "  .read <file.sql>\r\n"
-           "  .import [--csv] [--tabs] [--separator X] [--skip N] <file> <table>\r\n"
-           "\r\n"
-           "Notes:\r\n"
-           "  - .read reads up to 256KB per file.\r\n"
-           "  - .import uses VALUES(...) and binds all fields as TEXT.\r\n"
-           "  - Use --skip 1 for CSV header lines.\r\n");
+  send_str_tel(
+    "Dot commands:\r\n"
+    "  .help\r\n"
+    "  .quit | .exit\r\n"
+    "  .tables\r\n"
+    "  .schema [table]\r\n"
+    "  .headers on|off\r\n"
+    "  .mode list|csv|tabs\r\n"
+    "  .separator <sep>\r\n"
+    "  .nullvalue <text>\r\n"
+    "  .timeout <ms>\r\n"
+    "  .echo on|off\r\n"
+    "  .dbinfo\r\n"
+    "  .read <file.sql>\r\n"
+    "  .import [--csv] [--tabs] [--separator X] [--skip N] <file> <table>\r\n"
+    "\r\n"
+    "Filesystem:\r\n"
+    "  .ls [dir]             List directory (default /)\r\n"
+    "  .cat <file>           Show file contents\r\n"
+    "  .rm <file>            Remove file\r\n"
+    "  .mv <src> <dst>       Rename or move file\r\n"
+    "\r\n"
+    "Notes:\r\n"
+    "  - .read reads up to 256KB per file.\r\n"
+    "  - .import binds all fields as TEXT.\r\n"
+    "  - Use --skip 1 for CSV header lines.\r\n"
+  );
 }
 
-static void dot_tables(int fd)
+static void dot_tables(void)
 {
-  exec_sql_text(fd, "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;");
+  exec_sql_text("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;");
 }
 
-static void dot_schema(int fd, const char* table)
+static void dot_schema(const char* table)
 {
   if (!table || !*table)
   {
-    exec_sql_text(fd, "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name;");
+    exec_sql_text("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name;");
     return;
   }
   char* q = sqlite3_mprintf("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND name=%Q;", table);
   if (q)
   {
-    exec_sql_text(fd, q);
+    exec_sql_text(q);
     sqlite3_free(q);
   }
 }
 
-static void dot_dbinfo(int fd)
+static void dot_dbinfo(void)
 {
-  sendf(fd, "SQLite version: %s\r\n", sqlite3_libversion());
+  sendf_tel("SQLite version: %s\r\n", sqlite3_libversion());
   xSemaphoreTake(s_db_mutex, portMAX_DELAY);
-  sendf(fd, "changes=%d last_insert_rowid=%lld\r\n",
-        sqlite3_changes(s_db),
-        (long long)sqlite3_last_insert_rowid(s_db));
+  sendf_tel("changes=%d last_insert_rowid=%lld\r\n",
+            sqlite3_changes(s_db),
+            (long long)sqlite3_last_insert_rowid(s_db));
   xSemaphoreGive(s_db_mutex);
 }
 
-static bool handle_dot_command(int fd, char* line)
+/* ---------- filesystem dot commands ---------- */
+static void dot_ls(const char* path)
+{
+  const char* dirpath = (path && *path) ? path : "/sdcard";
+
+  DIR* d = opendir(dirpath);
+  if (!d)
+  {
+    sendf_tel("ERR: cannot open directory '%s' (errno=%d)\r\n", dirpath, errno);
+    return;
+  }
+
+  sendf_tel("Listing %s\r\n", dirpath);
+
+  struct dirent* e;
+  while ((e = readdir(d)) != NULL)
+  {
+    char full[256];
+    int n;
+
+    if (strcmp(dirpath, "/") == 0)
+      n = snprintf(full, sizeof(full), "/%s", e->d_name);
+    else
+      n = snprintf(full, sizeof(full), "%s/%s", dirpath, e->d_name);
+
+    // snprintf protection: voorkomt -Wformat-truncation
+    if (n < 0 || n >= (int)sizeof(full))
+    {
+      sendf_tel("[SKIP] path too long: %s/%s\r\n", dirpath, e->d_name);
+      continue;
+    }
+
+    struct stat st;
+    if (stat(full, &st) == 0)
+    {
+      if (S_ISDIR(st.st_mode))
+        sendf_tel("[DIR ] %s\r\n", e->d_name);
+      else
+        sendf_tel("[FILE] %s (%ld bytes)\r\n", e->d_name, (long)st.st_size);
+    }
+    else
+    {
+      sendf_tel("[????] %s\r\n", e->d_name);
+    }
+  }
+
+  closedir(d);
+}
+
+static void dot_cat(const char* path)
+{
+  if (!path || !*path)
+  {
+    send_str_tel("Usage: .cat <file>\r\n");
+    return;
+  }
+
+  FILE* f = fopen(path, "rb");
+  if (!f)
+  {
+    sendf_tel("ERR: cannot open '%s' (errno=%d)\r\n", path, errno);
+    return;
+  }
+
+  char buf[256];
+  size_t n;
+  while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+  {
+    if (s_sess.telnet) telnet_send(s_sess.telnet, buf, (unsigned)n);
+  }
+
+  fclose(f);
+  send_str_tel("\r\n");
+}
+
+static void dot_rm(const char* path)
+{
+  if (!path || !*path)
+  {
+    send_str_tel("Usage: .rm <file>\r\n");
+    return;
+  }
+
+  if (unlink(path) == 0)
+    sendf_tel("OK: removed '%s'\r\n", path);
+  else
+    sendf_tel("ERR: cannot remove '%s' (errno=%d)\r\n", path, errno);
+}
+
+static void dot_mv(const char* args)
+{
+  if (!args || !*args)
+  {
+    send_str_tel("Usage: .mv <src> <dst>\r\n");
+    return;
+  }
+
+  char src[160] = {0}, dst[160] = {0};
+  if (sscanf(args, "%159s %159s", src, dst) != 2)
+  {
+    send_str_tel("Usage: .mv <src> <dst>\r\n");
+    return;
+  }
+
+  if (rename(src, dst) == 0)
+    sendf_tel("OK: %s -> %s\r\n", src, dst);
+  else
+    sendf_tel("ERR: cannot rename %s -> %s (errno=%d)\r\n", src, dst, errno);
+}
+
+static bool handle_dot_command(char* line)
 {
   trim(line);
-  if (line[0] != '.')
-    return false;
+  if (line[0] != '.') return false;
 
   char *tok = NULL, *rest = NULL;
   split_first_token(line, &tok, &rest);
 
-  if (!strcmp(tok, ".help") || !strcmp(tok, ".?"))
-  {
-    dot_help(fd);
-    return true;
-  }
+  if (!strcmp(tok, ".help") || !strcmp(tok, ".?")) { dot_help(); return true; }
   if (!strcmp(tok, ".quit") || !strcmp(tok, ".exit"))
   {
-    send_str(fd, "bye\r\n");
-    shutdown(fd, SHUT_RDWR);
+    send_str_tel("bye\r\n");
+    // we close from the receive loop by forcing socket shutdown
+    shutdown(s_client_fd, SHUT_RDWR);
     return true;
   }
-  if (!strcmp(tok, ".tables"))
-  {
-    dot_tables(fd);
-    return true;
-  }
-  if (!strcmp(tok, ".schema"))
-  {
-    dot_schema(fd, (rest && *rest) ? rest : NULL);
-    return true;
-  }
+  if (!strcmp(tok, ".tables")) { dot_tables(); return true; }
+  if (!strcmp(tok, ".schema")) { dot_schema((rest && *rest) ? rest : NULL); return true; }
 
   if (!strcmp(tok, ".headers"))
   {
-    if (!rest || !*rest)
-    {
-      sendf(fd, "headers %s\r\n", s_opt.headers ? "on" : "off");
-      return true;
-    }
-    if (!strcmp(rest, "on"))
-      s_opt.headers = true;
-    else if (!strcmp(rest, "off"))
-      s_opt.headers = false;
-    else
-      send_str(fd, "Usage: .headers on|off\r\n");
+    if (!rest || !*rest) { sendf_tel("headers %s\r\n", s_opt.headers ? "on" : "off"); return true; }
+    if (!strcmp(rest, "on")) s_opt.headers = true;
+    else if (!strcmp(rest, "off")) s_opt.headers = false;
+    else send_str_tel("Usage: .headers on|off\r\n");
     return true;
   }
 
@@ -1033,33 +867,25 @@ static bool handle_dot_command(int fd, char* line)
   {
     if (!rest || !*rest)
     {
-      const char* m = (s_opt.mode == MODE_LIST) ? "list" : (s_opt.mode == MODE_CSV) ? "csv"
-                                                                                    : "tabs";
-      sendf(fd, "mode %s\r\n", m);
+      const char* m = (s_opt.mode == MODE_LIST) ? "list" : (s_opt.mode == MODE_CSV) ? "csv" : "tabs";
+      sendf_tel("mode %s\r\n", m);
       return true;
     }
-    if (!strcmp(rest, "list"))
-      s_opt.mode = MODE_LIST;
+    if (!strcmp(rest, "list")) s_opt.mode = MODE_LIST;
     else if (!strcmp(rest, "csv"))
     {
       s_opt.mode = MODE_CSV;
       strncpy(s_opt.sep, ",", sizeof(s_opt.sep) - 1);
       s_opt.sep[sizeof(s_opt.sep) - 1] = 0;
     }
-    else if (!strcmp(rest, "tabs"))
-      s_opt.mode = MODE_TABS;
-    else
-      send_str(fd, "Usage: .mode list|csv|tabs\r\n");
+    else if (!strcmp(rest, "tabs")) s_opt.mode = MODE_TABS;
+    else send_str_tel("Usage: .mode list|csv|tabs\r\n");
     return true;
   }
 
   if (!strcmp(tok, ".separator"))
   {
-    if (!rest || !*rest)
-    {
-      sendf(fd, "separator '%s'\r\n", s_opt.sep);
-      return true;
-    }
+    if (!rest || !*rest) { sendf_tel("separator '%s'\r\n", s_opt.sep); return true; }
     strncpy(s_opt.sep, rest, sizeof(s_opt.sep) - 1);
     s_opt.sep[sizeof(s_opt.sep) - 1] = 0;
     return true;
@@ -1067,8 +893,7 @@ static bool handle_dot_command(int fd, char* line)
 
   if (!strcmp(tok, ".nullvalue"))
   {
-    if (!rest)
-      rest = "";
+    if (!rest) rest = "";
     strncpy(s_opt.nullvalue, rest, sizeof(s_opt.nullvalue) - 1);
     s_opt.nullvalue[sizeof(s_opt.nullvalue) - 1] = 0;
     return true;
@@ -1076,66 +901,123 @@ static bool handle_dot_command(int fd, char* line)
 
   if (!strcmp(tok, ".timeout"))
   {
-    if (!rest || !*rest)
-    {
-      send_str(fd, "Usage: .timeout <ms>\r\n");
-      return true;
-    }
+    if (!rest || !*rest) { send_str_tel("Usage: .timeout <ms>\r\n"); return true; }
     int ms = atoi(rest);
-    if (ms < 0)
-      ms = 0;
+    if (ms < 0) ms = 0;
     xSemaphoreTake(s_db_mutex, portMAX_DELAY);
     sqlite3_busy_timeout(s_db, ms);
     xSemaphoreGive(s_db_mutex);
-    sendf(fd, "timeout %d ms\r\n", ms);
+    sendf_tel("timeout %d ms\r\n", ms);
     return true;
   }
 
   if (!strcmp(tok, ".echo"))
   {
-    if (!rest || !*rest)
-    {
-      sendf(fd, "echo %s\r\n", s_opt.echo ? "on" : "off");
-      return true;
-    }
-    if (!strcmp(rest, "on"))
-      s_opt.echo = true;
-    else if (!strcmp(rest, "off"))
-      s_opt.echo = false;
-    else
-      send_str(fd, "Usage: .echo on|off\r\n");
+    if (!rest || !*rest) { sendf_tel("echo %s\r\n", s_opt.echo ? "on" : "off"); return true; }
+    if (!strcmp(rest, "on")) s_opt.echo = true;
+    else if (!strcmp(rest, "off")) s_opt.echo = false;
+    else send_str_tel("Usage: .echo on|off\r\n");
     return true;
   }
 
-  if (!strcmp(tok, ".dbinfo"))
-  {
-    dot_dbinfo(fd);
-    return true;
-  }
+  if (!strcmp(tok, ".dbinfo")) { dot_dbinfo(); return true; }
 
-  if (!strcmp(tok, ".read"))
-  {
-    dot_read(fd, (rest && *rest) ? rest : NULL);
-    return true;
-  }
+  if (!strcmp(tok, ".read")) { dot_read((rest && *rest) ? rest : NULL); return true; }
 
   if (!strcmp(tok, ".import"))
   {
     if (!rest || !*rest)
     {
-      send_str(fd, "Usage: .import [--csv] [--skip N] [--separator X] <file> <table>\r\n");
+      send_str_tel("Usage: .import [--csv] [--skip N] [--separator X] <file> <table>\r\n");
       return true;
     }
-    // dot_import modifies args in-place; safe to pass rest
-    dot_import(fd, rest);
+    dot_import(rest);
     return true;
   }
 
-  send_str(fd, "Unknown dot-command. Try .help\r\n");
+  // filesystem commands
+  if (!strcmp(tok, ".ls"))  { dot_ls((rest && *rest) ? rest : NULL); return true; }
+  if (!strcmp(tok, ".cat")) { dot_cat((rest && *rest) ? rest : NULL); return true; }
+  if (!strcmp(tok, ".rm"))  { dot_rm((rest && *rest) ? rest : NULL); return true; }
+  if (!strcmp(tok, ".mv"))  { dot_mv((rest && *rest) ? rest : NULL); return true; }
+
+  send_str_tel("Unknown dot-command. Try .help\r\n");
   return true;
 }
 
-/* ---------- connection loop ---------- */
+/* ---------- RX processing: bytes die al "data" zijn (geen IAC) ---------- */
+static void process_rx_data_bytes(const uint8_t* data, size_t len)
+{
+  for (size_t i = 0; i < len; i++)
+  {
+    unsigned char ch = data[i];
+
+    if (ch == '\r' || ch == '\n')
+    {
+      s_sess.line[s_sess.llen] = 0;
+      send_str_tel("\r\n");
+
+      trim(s_sess.line);
+
+      if (s_sess.line[0] == '.')
+      {
+        char tmp[512];
+        strncpy(tmp, s_sess.line, sizeof(tmp) - 1);
+        tmp[sizeof(tmp) - 1] = 0;
+        (void)handle_dot_command(tmp);
+      }
+      else if (s_sess.line[0] != 0)
+      {
+        exec_sql_text(s_sess.line);
+      }
+
+      s_sess.llen = 0;
+      prompt_tel();
+      continue;
+    }
+
+    if (ch == 0x08 || ch == 0x7F)
+    {
+      if (s_sess.llen > 0)
+      {
+        s_sess.llen--;
+        if (s_opt.echo) send_str_tel("\b \b");
+      }
+      continue;
+    }
+
+    if (isprint(ch) && s_sess.llen < (int)sizeof(s_sess.line) - 1)
+    {
+      s_sess.line[s_sess.llen++] = (char)ch;
+      if (s_opt.echo)
+      {
+        char c = (char)ch;
+        telnet_send(s_sess.telnet, &c, 1);
+      }
+    }
+  }
+}
+
+/* libtelnet geeft TELNET_EV_DATA events; die zijn "user input" */
+static void telnet_data_event_handler(telnet_t* telnet, telnet_event_t* ev, void* user_data)
+{
+  (void)telnet;
+  (void)user_data;
+
+  if (ev->type == TELNET_EV_DATA)
+  {
+    if (ev->data.buffer && ev->data.size > 0)
+      process_rx_data_bytes((const uint8_t*)ev->data.buffer, ev->data.size);
+  }
+  else
+  {
+    // de rest (SEND/ERROR) gaat via telnet_event_handler, maar libtelnet staat maar 1 handler toe.
+    // daarom forwarden we de relevante types hier ook:
+    telnet_event_handler(telnet, ev, user_data);
+  }
+}
+
+/* ---------- connection loop (zoals je oude, maar telnet via libtelnet) ---------- */
 static void telnet_task(void* arg)
 {
   const int port = (int)(intptr_t)arg;
@@ -1189,99 +1071,46 @@ static void telnet_task(void* arg)
       continue;
     }
 
-    // last client wins (sluit oude client, niet de nieuwe)
+    // last client wins
     close_client_locked();
     s_client_fd = fd;
 
-    telnet_init(fd);
-    telnet_drain_negotiation(fd);
+    // telnet init
+    s_sess.telnet = telnet_init(s_telopts, telnet_data_event_handler, 0, NULL);
+    s_sess.llen = 0;
 
-    send_str(fd, "\r\nESP32 SQLite console (telnet)\r\n");
-    send_str(fd, "Dot commands: .help  | SQL: type statements directly\r\n");
-    send_str(fd, "Files: .read /spiffs/init.sql  |  .import --csv --skip 1 /spiffs/data.csv mytable\r\n\r\n");
-    prompt(fd);
-    char line[512];
-    int llen = 0;
+    send_str_tel("\r\nESP32 SQLite console (telnet)\r\n");
+    send_str_tel("Dot commands: .help  | SQL: type statements directly\r\n");
+    send_str_tel("Files: .read /spiffs/init.sql  |  .import --csv --skip 1 /spiffs/data.csv mytable\r\n\r\n");
+    prompt_tel();
 
     while (1)
     {
-      unsigned char buf[128];
-      int r = recv_filtered(fd, buf, sizeof(buf));
+      unsigned char buf[256];
+      int r = recv(fd, buf, sizeof(buf), 0);
       if (r <= 0)
       {
-        ESP_LOGW(TAG, "recv_filtered=%d errno=%d (closing client)", r, errno);
+        ESP_LOGW(TAG, "recv=%d errno=%d (closing client)", r, errno);
         break;
       }
-      for (int i = 0; i < r; i++)
-      {
-        unsigned char ch = buf[i];
 
-        // Treat CR or LF as "Enter" (telnet often sends CR)
-        if (ch == '\r' || ch == '\n')
-        {
-          line[llen] = 0;
-          send_str(fd, "\r\n");
-
-          trim(line);
-
-          if (line[0] == '.')
-          {
-            char tmp[512];
-            strncpy(tmp, line, sizeof(tmp) - 1);
-            tmp[sizeof(tmp) - 1] = 0;
-            (void)handle_dot_command(fd, tmp);
-
-            if (fd != s_client_fd || s_client_fd < 0)
-              goto client_done;
-          }
-          else if (line[0] != 0)
-          {
-            exec_sql_text(fd, line);
-          }
-
-          llen = 0;
-          if (fd == s_client_fd)
-            prompt(fd);
-          continue;
-        }
-        // backspace
-        if (ch == 0x08 || ch == 0x7F)
-        {
-          if (llen > 0)
-          {
-            llen--;
-            if (s_opt.echo)
-              send_str(fd, "\b \b");
-          }
-          continue;
-        }
-
-        if (isprint(ch) && llen < (int)sizeof(line) - 1)
-        {
-          line[llen++] = (char)ch;
-          if (s_opt.echo)
-            send(fd, &ch, 1, 0);
-        }
-      }
+      // voed raw bytes aan telnet parser; die maakt TELNET_EV_DATA events voor user data
+      telnet_recv(s_sess.telnet, (const char*)buf, (unsigned)r);
     }
 
-  client_done:
     if (fd == s_client_fd)
     {
-      shutdown(fd, SHUT_RDWR);
       ESP_LOGI(TAG, "client disconnected/closing");
-      close(fd);
-      s_client_fd = -1;
+      close_client_locked();
     }
   }
 }
 
+/* ---------- public start ---------- */
 esp_err_t telnet_sqlite_console_start(sqlite3* db, SemaphoreHandle_t db_mutex, int port)
 {
-  if (!db || !db_mutex)
-    return ESP_ERR_INVALID_ARG;
-  if (port <= 0)
-    port = 23;
+  if (!db || !db_mutex) return ESP_ERR_INVALID_ARG;
+  if (port <= 0) port = 23;
 
   s_db = db;
   s_db_mutex = db_mutex;
